@@ -4,20 +4,30 @@ import {
   BookOpenText,
   Boxes,
   ExternalLink,
+  FolderGit2,
   Heart,
   LogOut,
   Octagon,
   PanelLeftClose,
   PanelLeftOpen,
+  Plus,
   Settings,
   ShieldCheck,
+  X,
 } from "lucide-react";
 import { api, getToken, setToken } from "./api.js";
 import StatusPanel from "./components/StatusPanel.jsx";
 import LogViewer from "./components/LogViewer.jsx";
 import ConfigPanel from "./components/ConfigPanel.jsx";
 import AccountsPanel from "./components/AccountsPanel.jsx";
-import { Badge, Button, Card, Input, Spinner } from "./components/ui.jsx";
+import {
+  Badge,
+  Button,
+  Card,
+  Dialog,
+  Input,
+  Spinner,
+} from "./components/ui.jsx";
 
 const NAV = [
   { id: "status", label: "Status", icon: Activity },
@@ -32,6 +42,12 @@ export default function App() {
   const [password, setPassword] = useState("");
   const [running, setRunning] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [group, setGroup] = useState("");
+  const [groups, setGroups] = useState([]);
+  const [groupCreateOpen, setGroupCreateOpen] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
+  const [groupBusy, setGroupBusy] = useState(false);
+  const [groupDelete, setGroupDelete] = useState(null); // group name | null
 
   useEffect(() => {
     api
@@ -51,6 +67,56 @@ export default function App() {
     );
     return () => clearInterval(timer);
   }, [auth]);
+
+  function loadGroups() {
+    api.get("/api/groups").then((d) => setGroups(d.groups || [])).catch(() => {});
+  }
+  useEffect(() => {
+    if (auth === null) return undefined;
+    if (auth.needs && !getToken()) return undefined;
+    loadGroups();
+    const t = setInterval(loadGroups, 10000);
+    return () => clearInterval(t);
+  }, [auth]);
+
+  function selectGroup(name) {
+    setGroup(name);
+    setTab("accounts");
+  }
+
+  async function doCreateGroup() {
+    const name = newGroupName.trim();
+    if (!name || groupBusy) return;
+    setGroupBusy(true);
+    try {
+      await api.post("/api/groups", { name });
+      setGroupCreateOpen(false);
+      setNewGroupName("");
+      setGroup(name);
+      setTab("accounts");
+      loadGroups();
+    } catch (e) {
+      alert(`Gagal membuat group: ${e.message}`);
+    } finally {
+      setGroupBusy(false);
+    }
+  }
+
+  async function doDeleteGroup() {
+    const name = groupDelete;
+    if (!name || groupBusy) return;
+    setGroupBusy(true);
+    try {
+      await api.del(`/api/groups?name=${encodeURIComponent(name)}`);
+      if (group === name) setGroup("");
+      loadGroups();
+    } catch (e) {
+      alert(`Gagal menghapus group: ${e.message}`);
+    } finally {
+      setGroupBusy(false);
+      setGroupDelete(null);
+    }
+  }
 
   async function doLogin() {
     try {
@@ -145,13 +211,63 @@ export default function App() {
             <button
               key={id}
               className={tab === id ? "app-nav-item active" : "app-nav-item"}
-              onClick={() => setTab(id)}
+              onClick={() => {
+                setTab(id);
+                if (id === "accounts") setGroup("");
+              }}
               title={label}
             >
               <Icon size={17} />
               <span>{label}</span>
             </button>
           ))}
+          <div className="app-nav-groups">
+            <div className="app-nav-label">
+              <span>Groups</span>
+              <button
+                type="button"
+                className="app-nav-add"
+                onClick={() => {
+                  setNewGroupName("");
+                  setGroupCreateOpen(true);
+                }}
+                title="Group baru"
+                aria-label="Group baru"
+              >
+                <Plus size={14} />
+              </button>
+            </div>
+            {groups.map((g) => (
+              <div key={g.name} className="app-group-row">
+                <button
+                  type="button"
+                  className={
+                    tab === "accounts" && group === g.name
+                      ? "app-nav-item active"
+                      : "app-nav-item"
+                  }
+                  onClick={() => selectGroup(g.name)}
+                  title={`${g.name} · ${g.count} akun`}
+                >
+                  <FolderGit2 size={16} />
+                  <span className="app-group-name">{g.name}</span>
+                  <span className="app-group-count">{g.count}</span>
+                </button>
+                <button
+                  type="button"
+                  className="app-group-del"
+                  onClick={() => setGroupDelete(g.name)}
+                  title={`Hapus group ${g.name}`}
+                  aria-label={`Hapus group ${g.name}`}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+            {groups.length === 0 && (
+              <div className="app-nav-empty">Belum ada group</div>
+            )}
+          </div>
         </nav>
         <div className="app-sidebar-footer">
           <Badge tone={running ? "success" : "muted"}>
@@ -195,9 +311,67 @@ export default function App() {
       <main className="app-main" key={tab}>
         <ActivePanel
           onGotoLogs={() => setTab("log")}
-          onGotoAccounts={() => setTab("accounts")}
+          onGotoAccounts={() => {
+            setTab("accounts");
+            setGroup("");
+          }}
+          group={group}
+          onClearGroup={() => setGroup("")}
+          onGroupsChanged={loadGroups}
         />
       </main>
+
+      <Dialog
+        open={groupCreateOpen}
+        onClose={() => !groupBusy && setGroupCreateOpen(false)}
+        title="Group baru"
+        footer={
+          <>
+            <Button onClick={() => setGroupCreateOpen(false)} disabled={groupBusy}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              onClick={doCreateGroup}
+              disabled={groupBusy || !newGroupName.trim()}
+            >
+              <Plus size={15} /> Create
+            </Button>
+          </>
+        }
+      >
+        <div style={{ display: "grid", gap: 10 }}>
+          <Input
+            autoFocus
+            value={newGroupName}
+            onChange={(e) => setNewGroupName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && doCreateGroup()}
+            placeholder="Nama group, mis. Github"
+            disabled={groupBusy}
+          />
+          <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+            Hanya huruf, angka, <code>-</code>, <code>_</code>, dan{" "}
+            <code>.</code> (maks 60 karakter).
+          </div>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={!!groupDelete}
+        onClose={() => setGroupDelete(null)}
+        title="Hapus group ini?"
+        footer={
+          <>
+            <Button onClick={() => setGroupDelete(null)}>Cancel</Button>
+            <Button variant="destructive" onClick={doDeleteGroup} disabled={groupBusy}>
+              <X size={15} /> Delete
+            </Button>
+          </>
+        }
+      >
+        Group <strong>{groupDelete}</strong> akan dihapus. Akun di dalamnya
+        tidak ikut terhapus — hanya dikeluarkan dari group.
+      </Dialog>
     </div>
   );
 }

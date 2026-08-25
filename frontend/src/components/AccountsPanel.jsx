@@ -1,16 +1,20 @@
 import React, { useEffect, useState } from 'react'
-import { Copy, Download, FileJson, FileText, KeyRound, ShieldCheck, Trash2 } from 'lucide-react'
+import { Copy, Download, FileJson, FileText, FolderGit2, KeyRound, Pencil, ShieldCheck, Trash2, UserMinus, UserPlus } from 'lucide-react'
 import { api, getToken } from '../api.js'
-import { Button, Card, Dialog, EmptyState, Spinner } from './ui.jsx'
+import { Button, Card, Dialog, EmptyState, Input, Spinner } from './ui.jsx'
 
 const fmtSize = (n) => (n > 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`)
 
-export default function AccountsPanel() {
+export default function AccountsPanel({ group = '', onClearGroup, onGroupsChanged }) {
   const [files, setFiles] = useState([])
   const [selected, setSelected] = useState(null)
   const [rows, setRows] = useState([])
   const [toast, setToast] = useState('')
   const [confirm, setConfirm] = useState(null) // {type:'row'|'file', ...}
+  const [rename, setRename] = useState(null) // {name, value} | null
+  const [renameBusy, setRenameBusy] = useState(false)
+  const [assign, setAssign] = useState(null) // {email, groups, newName} | null
+  const [assignBusy, setAssignBusy] = useState(false)
   const [recovery, setRecovery] = useState(null) // {email, codes} | null
   const [recoveryLoading, setRecoveryLoading] = useState(false)
   // loading flags — only true for user-visible loads, NOT background polling
@@ -35,14 +39,18 @@ export default function AccountsPanel() {
   const currentName = selected || files[0]?.name || ''
 
   const loadRows = (name, silent = false) => {
-    if (!name) {
+    const target = group || name
+    if (!target) {
       setRows([])
       setLoadingRows(false)
       return
     }
     if (!silent) setLoadingRows(true)
+    const url = group
+      ? `/api/accounts/preview?group=${encodeURIComponent(group)}`
+      : `/api/accounts/preview?name=${encodeURIComponent(name)}`
     api
-      .get(`/api/accounts/preview?name=${encodeURIComponent(name)}`)
+      .get(url)
       .then((d) => setRows(d.rows || []))
       .catch(() => setRows([]))
       .finally(() => setLoadingRows(false))
@@ -62,7 +70,7 @@ export default function AccountsPanel() {
   useEffect(() => {
     loadRows(currentName, false)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, currentName])
+  }, [selected, currentName, group])
 
   async function copyAll() {
     const text = rows.map((r) => `${r.email}----${r.password}----${r.username}----${r.totp || ''}`).join('\n')
@@ -197,6 +205,85 @@ export default function AccountsPanel() {
     }
   }
 
+  async function doRenameFile() {
+    const { name } = rename
+    const value = rename.value.trim()
+    if (!value) return
+    setRenameBusy(true)
+    try {
+      const d = await api.post('/api/accounts/rename', { name, new_name: value })
+      notify(d.renamed ? `✓ File renamed to ${d.name}` : `✓ Name unchanged`)
+      const next = d.renamed ? d.name : name
+      setRename(null)
+      setSelected(next)
+      loadFiles()
+    } catch (e) {
+      notify('✗ ' + e.message)
+    } finally {
+      setRenameBusy(false)
+    }
+  }
+
+  async function openAssign(email) {
+    setAssign({ email, groups: null, newName: '' })
+    try {
+      const d = await api.get('/api/groups')
+      setAssign((a) => (a && a.email === email ? { ...a, groups: d.groups || [] } : a))
+    } catch (e) {
+      setAssign(null)
+      notify('✗ ' + e.message)
+    }
+  }
+
+  async function assignTo(groupName) {
+    if (!assign || assignBusy) return
+    setAssignBusy(true)
+    try {
+      await api.post('/api/groups/assign', { email: assign.email, group: groupName })
+      notify(`✓ ${assign.email} → ${groupName}`)
+      setAssign(null)
+      loadRows(currentName, true)
+      onGroupsChanged?.()
+    } catch (e) {
+      notify('✗ ' + e.message)
+    } finally {
+      setAssignBusy(false)
+    }
+  }
+
+  async function createAndAssign() {
+    const name = assign?.newName?.trim()
+    if (!name || assignBusy) return
+    setAssignBusy(true)
+    try {
+      await api.post('/api/groups', { name })
+    } catch {
+      // sudah ada / invalid — biarkan endpoint assign yang konfirmasi
+    }
+    try {
+      await api.post('/api/groups/assign', { email: assign.email, group: name })
+      notify(`✓ ${assign.email} → ${name}`)
+      setAssign(null)
+      loadRows(currentName, true)
+      onGroupsChanged?.()
+    } catch (e) {
+      notify('✗ ' + e.message)
+    } finally {
+      setAssignBusy(false)
+    }
+  }
+
+  async function removeFromGroup(email) {
+    try {
+      await api.post('/api/groups/assign', { email, group: '' })
+      notify(`✓ ${email} dikeluarkan dari ${group}`)
+      loadRows(currentName, true)
+      onGroupsChanged?.()
+    } catch (e) {
+      notify('✗ ' + e.message)
+    }
+  }
+
   return (
     <div style={styles.wrap}>
       {/* header + file selector */}
@@ -204,7 +291,13 @@ export default function AccountsPanel() {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 12 }}>
           <div>
             <div style={{ fontSize: 19, fontWeight: 800, display: 'flex', alignItems: 'center', gap: 10 }}>
-              Registered Accounts
+              {group ? (
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                  <FolderGit2 size={18} /> Group: {group}
+                </span>
+              ) : (
+                'Registered Accounts'
+              )}
               {(loadingFiles || loadingRows) && (
                 <Spinner />
               )}
@@ -212,27 +305,47 @@ export default function AccountsPanel() {
             <div style={{ fontSize: 12.5, color: 'var(--muted)', marginTop: 3 }}>
               {loadingRows && rows.length === 0
                 ? 'Loading accounts…'
-                : <>{rows.length} accounts {currentName && `· ${currentName}`}</>}
+                : group
+                  ? <>{rows.length} accounts · dari semua file</>
+                  : <>{rows.length} accounts {currentName && `· ${currentName}`}</>}
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {group && (
+              <Button onClick={onClearGroup} title="Kembali ke semua akun">
+                ← Semua Akun
+              </Button>
+            )}
             <Button onClick={copyAll} disabled={!rows.length}><Copy size={15} /> Copy Semua</Button>
             <Button onClick={exportTxt} disabled={!rows.length}><FileText size={15} /> TXT</Button>
             <Button onClick={exportCsv} disabled={!rows.length}>CSV</Button>
             <Button onClick={exportJson} disabled={!rows.length}><FileJson size={15} /> JSON</Button>
-            <Button variant="primary" onClick={downloadRaw} disabled={!files.length}><Download size={15} /> Download</Button>
-            {files.length > 1 && (
-              <Button variant="destructive"
-                onClick={() => setConfirm({ type: 'file', name: currentName })}
-                disabled={!currentName}
-              >
-                <Trash2 size={15} /> Delete File
-              </Button>
+            {!group && (
+              <>
+                <Button variant="primary" onClick={downloadRaw} disabled={!files.length}><Download size={15} /> Download</Button>
+                {files.length > 0 && (
+                  <Button
+                    onClick={() => setRename({ name: currentName, value: currentName.replace('github_accounts_', '').replace('.txt', '') })}
+                    disabled={!currentName}
+                    title="Rename file accounts"
+                  >
+                    <Pencil size={15} /> Rename
+                  </Button>
+                )}
+                {files.length > 1 && (
+                  <Button variant="destructive"
+                    onClick={() => setConfirm({ type: 'file', name: currentName })}
+                    disabled={!currentName}
+                  >
+                    <Trash2 size={15} /> Delete File
+                  </Button>
+                )}
+              </>
             )}
           </div>
         </div>
 
-        {files.length > 1 && (
+        {!group && files.length > 1 && (
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             {files.slice(0, 8).map((f) => {
               const active = currentName === f.name
@@ -257,7 +370,7 @@ export default function AccountsPanel() {
         {rows.length === 0 && (loadingFiles || loadingRows) ? (
           <TableSkeleton />
         ) : rows.length === 0 ? (
-          <EmptyState icon={FileText} title={files.length === 0 ? 'No account files yet' : 'This file is empty'} description={files.length === 0 ? 'Run a job from the Status page to create account output.' : undefined} />
+          <EmptyState icon={group ? FolderGit2 : FileText} title={group ? 'Group ini masih kosong' : files.length === 0 ? 'No account files yet' : 'This file is empty'} description={group ? 'Tambahkan akun lewat tombol “+ Group” di halaman Registered Accounts.' : files.length === 0 ? 'Run a job from the Status page to create account output.' : undefined} />
         ) : (
           <div style={{ overflowY: 'auto', maxHeight: 'calc(100vh - 320px)' }}>
             <table style={styles.table}>
@@ -268,6 +381,7 @@ export default function AccountsPanel() {
                   <th style={styles.th}>Password</th>
                   <th style={styles.th}>Username</th>
                   <th style={styles.th}>TOTP Secret</th>
+                  {!group && <th style={styles.th}>Group</th>}
                   <th style={{ ...styles.th, width: 190 }}>Aksi</th>
                 </tr>
               </thead>
@@ -305,8 +419,34 @@ export default function AccountsPanel() {
                         <span style={{ color: 'var(--muted)' }}>—</span>
                       )}
                     </td>
+                    {!group && (
+                      <td style={styles.td}>
+                        {r.group ? (
+                          <button type="button" className="group-badge" onClick={() => openAssign(r.email)} title="Ubah group akun ini">
+                            <FolderGit2 size={11} /> {r.group}
+                          </button>
+                        ) : (
+                          <span style={{ color: 'var(--muted)' }}>—</span>
+                        )}
+                      </td>
+                    )}
                     <td style={styles.td}>
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        {group ? (
+                          <Button size="sm"
+                            onClick={() => removeFromGroup(r.email)}
+                            title="Keluarkan akun dari group ini"
+                          >
+                            <UserMinus size={13} /> Remove
+                          </Button>
+                        ) : (
+                          <Button size="sm"
+                            onClick={() => openAssign(r.email)}
+                            title="Tambahkan akun ini ke group"
+                          >
+                            <UserPlus size={13} /> Group
+                          </Button>
+                        )}
                         <Button size="sm"
                           onClick={() => {
                             const line = `${r.email}----${r.password}----${r.username}----${r.totp || ''}`
@@ -336,11 +476,13 @@ export default function AccountsPanel() {
                             <ShieldCheck size={13} /> Recovery
                           </Button>
                         )}
-                        <Button variant="destructive" size="sm"
-                          onClick={() => setConfirm({ type: 'row', email: r.email, name: currentName })}
-                        >
-                          <Trash2 size={13} /> Delete
-                        </Button>
+                        {!group && (
+                          <Button variant="destructive" size="sm"
+                            onClick={() => setConfirm({ type: 'row', email: r.email, name: currentName })}
+                          >
+                            <Trash2 size={13} /> Delete
+                          </Button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -366,6 +508,81 @@ export default function AccountsPanel() {
         footer={<><Button onClick={() => setConfirm(null)}>Cancel</Button><Button variant="destructive" onClick={confirm?.type === 'file' ? doDeleteFile : doDeleteRow}><Trash2 size={15} /> Delete</Button></>}
       >
         {confirm?.type === 'file' ? <>File <strong>{confirm.name}</strong> and all of its accounts will be permanently deleted.</> : <>Account <strong>{confirm?.email}</strong> will be deleted from {confirm?.name}. This action cannot be undone.</>}
+      </Dialog>
+
+      <Dialog
+        open={!!rename}
+        onClose={() => !renameBusy && setRename(null)}
+        title="Rename accounts file"
+        footer={<><Button onClick={() => setRename(null)} disabled={renameBusy}>Cancel</Button><Button variant="primary" onClick={doRenameFile} disabled={renameBusy || !rename?.value?.trim()}><Pencil size={15} /> Rename</Button></>}
+      >
+        {rename && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ fontSize: 13, color: 'var(--muted)' }}>
+              Renaming <strong style={{ color: 'var(--text)' }}>{rename.name}</strong>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontFamily: "'SF Mono', Menlo, monospace", fontSize: 12, color: 'var(--muted)', whiteSpace: 'nowrap' }}>github_accounts_</span>
+              <Input
+                autoFocus
+                value={rename.value}
+                onChange={(e) => setRename({ ...rename, value: e.target.value })}
+                onKeyDown={(e) => e.key === 'Enter' && !renameBusy && rename.value.trim() && doRenameFile()}
+                placeholder="nama-baru"
+                disabled={renameBusy}
+                style={{ flex: 1 }}
+              />
+              <span style={{ fontFamily: "'SF Mono', Menlo, monospace", fontSize: 12, color: 'var(--muted)', whiteSpace: 'nowrap' }}>.txt</span>
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--muted)' }}>
+              Hanya huruf, angka, <code>-</code>, <code>_</code>, dan <code>.</code> yang diperbolehkan.
+            </div>
+          </div>
+        )}
+      </Dialog>
+
+      <Dialog
+        open={!!assign}
+        onClose={() => !assignBusy && setAssign(null)}
+        title="Tambah ke group"
+      >
+        {assign && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ fontSize: 13, color: 'var(--muted)', overflowWrap: 'anywhere' }}>
+              Akun <strong style={{ color: 'var(--text)' }}>{assign.email}</strong>
+            </div>
+            {assign.groups === null ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0' }}>
+                <Spinner /> <span style={{ fontSize: 12.5, color: 'var(--muted)' }}>Loading groups…</span>
+              </div>
+            ) : assign.groups.length === 0 ? (
+              <div style={{ fontSize: 12.5, color: 'var(--muted)' }}>Belum ada group — buat lewat kolom di bawah.</div>
+            ) : (
+              <div className="group-pick-list">
+                {assign.groups.map((g) => (
+                  <button key={g.name} type="button" className="group-pick" onClick={() => assignTo(g.name)} disabled={assignBusy}>
+                    <FolderGit2 size={14} />
+                    <span className="group-pick-name">{g.name}</span>
+                    <span className="group-pick-count">{g.count} akun</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <Input
+                value={assign.newName}
+                onChange={(e) => setAssign({ ...assign, newName: e.target.value })}
+                onKeyDown={(e) => e.key === 'Enter' && createAndAssign()}
+                placeholder="Atau buat group baru, mis. Github"
+                disabled={assignBusy}
+                style={{ flex: 1 }}
+              />
+              <Button variant="primary" onClick={createAndAssign} disabled={assignBusy || !assign.newName.trim()}>
+                <UserPlus size={14} /> Buat & Masukkan
+              </Button>
+            </div>
+          </div>
+        )}
       </Dialog>
 
       <Dialog

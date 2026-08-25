@@ -23,6 +23,8 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parent.parent
 ACCOUNTS_DIR = ROOT / "accounts"
 RECOVERY_DIR = ACCOUNTS_DIR / "recovery"
+GROUPS_FILE = ACCOUNTS_DIR / "groups.json"
+_groups_lock = threading.Lock()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -498,9 +500,31 @@ async def api_totp_code(
 async def api_accounts_preview(
     x_access_key: Optional[str] = Header(None),
     name: Optional[str] = Query(None),
+    group: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
-    """Parsed account rows of one file (or the newest) for the export panel."""
+    """Parsed account rows of one file (or the newest) for the export panel.
+
+    With ?group=<name> returns the union of that group's members across ALL
+    accounts files (deduplicated by email, newest occurrence wins).
+    """
     _require_auth(x_access_key)
+    with _groups_lock:
+        gdata = _load_groups()
+    if group is not None:
+        if group not in gdata["groups"]:
+            raise HTTPException(status_code=404, detail="group not found")
+        files = sorted(ACCOUNTS_DIR.glob("github_accounts_*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        seen: set = set()
+        rows: List[Dict[str, str]] = []
+        for f in files:
+            for row in _parse_accounts_file(f):
+                key = row["email"].strip().lower()
+                if key in seen or gdata["assignments"].get(key) != group:
+                    continue
+                seen.add(key)
+                row["group"] = group
+                rows.append(row)
+        return {"ok": True, "rows": rows, "total": len(rows), "name": "", "group": group}
     if name:
         safe = Path(name).name
         path = ACCOUNTS_DIR / safe
@@ -512,6 +536,8 @@ async def api_accounts_preview(
             return {"ok": True, "rows": [], "total": 0, "name": ""}
         path = files[0]
     rows = _parse_accounts_file(path)
+    for row in rows:
+        row["group"] = gdata["assignments"].get(row["email"].strip().lower(), "")
     return {"ok": True, "rows": rows, "total": len(rows), "name": path.name}
 
 
@@ -557,7 +583,168 @@ async def api_accounts_delete_row(
     recovery = _recovery_path(body.email)
     if recovery.is_file():
         recovery.unlink()
+    with _groups_lock:
+        gdata = _load_groups()
+        if gdata["assignments"].pop(body.email.strip().lower(), None) is not None:
+            _save_groups(gdata)
     return {"ok": True, "deleted": len(lines) - len(kept), "remaining": len(kept)}
+
+
+class RenameFileBody(BaseModel):
+    name: str  # current accounts file name
+    new_name: str  # new base name (without github_accounts_ prefix / .txt suffix)
+
+
+@app.post("/api/accounts/rename")
+async def api_accounts_rename_file(
+    body: RenameFileBody, x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    """Rename an accounts file, keeping the github_accounts_<name>.txt pattern."""
+    _require_auth(x_access_key)
+    old = Path(body.name).name
+    old_path = ACCOUNTS_DIR / old
+    if not old.startswith("github_accounts_") or not old.endswith(".txt") or not old_path.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+
+    base = body.new_name.strip()
+    # strip prefix/suffix if the user typed the full old-style name
+    for prefix in ("github_accounts_", "github_accounts"):
+        if base.lower().startswith(prefix):
+            base = base[len(prefix):]
+            break
+    if base.lower().endswith(".txt"):
+        base = base[:-4]
+    base = base.strip()
+    if not base:
+        raise HTTPException(status_code=400, detail="new name cannot be empty")
+    if not all(ch.isalnum() or ch in "-_." for ch in base):
+        raise HTTPException(
+            status_code=400, detail="new name may only contain letters, digits, '-', '_' and '.'"
+        )
+    if len(base) > 120:
+        raise HTTPException(status_code=400, detail="new name is too long (max 120 chars)")
+
+    new = f"github_accounts_{base}.txt"
+    if new == old:
+        return {"ok": True, "renamed": False, "name": old, "detail": "name unchanged"}
+    new_path = ACCOUNTS_DIR / new
+    if new_path.exists():
+        raise HTTPException(status_code=409, detail=f"a file named {new} already exists")
+
+    old_path.replace(new_path)
+    return {"ok": True, "renamed": True, "name": new, "old_name": old}
+
+
+# ---------- account groups ----------
+# groups.json: {"groups": ["Github", ...], "assignments": {email_lower: group}}
+# Membership is keyed by email so an account keeps its group even if its
+# accounts file is renamed; deleting the row removes the assignment.
+
+def _load_groups() -> Dict[str, Any]:
+    try:
+        data = json.loads(GROUPS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"groups": [], "assignments": {}}
+    groups = data.get("groups") if isinstance(data, dict) else None
+    assignments = data.get("assignments") if isinstance(data, dict) else None
+    return {
+        "groups": [str(g) for g in groups] if isinstance(groups, list) else [],
+        "assignments": (
+            {str(k): str(v) for k, v in assignments.items()}
+            if isinstance(assignments, dict) else {}
+        ),
+    }
+
+
+def _save_groups(data: Dict[str, Any]) -> None:
+    ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = GROUPS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(GROUPS_FILE)
+
+
+def _valid_group_name(name: str) -> bool:
+    return 0 < len(name) <= 60 and all(ch.isalnum() or ch in "-_." for ch in name)
+
+
+class GroupBody(BaseModel):
+    name: str
+
+
+@app.get("/api/groups")
+async def api_groups_list(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    with _groups_lock:
+        data = _load_groups()
+    counts = collections.Counter(data["assignments"].values())
+    items = [{"name": g, "count": counts.get(g, 0)} for g in data["groups"]]
+    return {"ok": True, "groups": items}
+
+
+@app.post("/api/groups")
+async def api_groups_create(
+    body: GroupBody, x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    name = " ".join((body.name or "").split())
+    if not _valid_group_name(name):
+        raise HTTPException(
+            status_code=400,
+            detail="group name may only contain letters, digits, '-', '_', '.' (max 60 chars)",
+        )
+    with _groups_lock:
+        data = _load_groups()
+        if name in data["groups"]:
+            raise HTTPException(status_code=409, detail=f"group already exists: {name}")
+        data["groups"].append(name)
+        _save_groups(data)
+    return {"ok": True, "created": True, "group": name}
+
+
+@app.delete("/api/groups")
+async def api_groups_delete(
+    x_access_key: Optional[str] = Header(None),
+    name: str = Query(...),
+) -> Dict[str, Any]:
+    _require_auth(x_access_key)
+    with _groups_lock:
+        data = _load_groups()
+        if name not in data["groups"]:
+            raise HTTPException(status_code=404, detail="group not found")
+        data["groups"].remove(name)
+        removed = sum(1 for g in data["assignments"].values() if g == name)
+        data["assignments"] = {e: g for e, g in data["assignments"].items() if g != name}
+        _save_groups(data)
+    return {"ok": True, "deleted": name, "unassigned": removed}
+
+
+class AssignBody(BaseModel):
+    email: str
+    group: str = ""  # empty string = remove from any group
+
+
+@app.post("/api/groups/assign")
+async def api_groups_assign(
+    body: AssignBody, x_access_key: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    """Assign one account (by email) to a group; empty group unassigns."""
+    _require_auth(x_access_key)
+    email = body.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="invalid email")
+    with _groups_lock:
+        data = _load_groups()
+        group = body.group.strip()
+        if group:
+            if not _valid_group_name(group):
+                raise HTTPException(status_code=400, detail="invalid group name")
+            if group not in data["groups"]:
+                raise HTTPException(status_code=404, detail=f"group not found: {group}")
+            data["assignments"][email] = group
+        else:
+            data["assignments"].pop(email, None)
+        _save_groups(data)
+    return {"ok": True, "email": email, "group": group}
 
 
 @app.delete("/api/accounts/file")
