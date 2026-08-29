@@ -1,6 +1,7 @@
 """Self-check for non-network logic. Run: python -m tests.test_core"""
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -38,6 +39,30 @@ def test_username():
         assert is_valid_username(name), name
 
 
+def test_generate_repo_name():
+    from github_register.profiles import _REPO_PROJECTS, generate_repo_name
+
+    assert "todo-list" in _REPO_PROJECTS
+    assert "portfolio" in _REPO_PROJECTS
+    for _ in range(50):
+        name = generate_repo_name()
+        assert name in _REPO_PROJECTS, name
+        assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name), name
+        assert "hex" not in name
+        assert not re.search(r"-[0-9a-f]{4}$", name)
+
+
+def test_generate_profile_status():
+    from github_register.profiles import _PROFILE_STATUSES, generate_profile_status
+
+    assert "On vacation" in _PROFILE_STATUSES
+    assert "Focusing" in _PROFILE_STATUSES
+    for _ in range(30):
+        status = generate_profile_status()
+        assert status in _PROFILE_STATUSES
+        assert status.strip()
+
+
 def test_litensi_zone_pick():
     from github_register.litensi import LitensiClient
 
@@ -53,9 +78,31 @@ def test_litensi_zone_pick():
 
 def test_proxy_pool_pick():
     from github_register.config import Config
-    from github_register.runner import _pick_proxy_url, load_proxy_pool
+    from github_register.runner import (
+        _pick_proxy_url,
+        load_proxy_pool,
+        normalize_proxy_line,
+        proxy_display,
+        proxy_endpoint,
+    )
 
     from github_register import runner
+
+    assert normalize_proxy_line("1.2.3.4:8080:user:pass") == "http://user:pass@1.2.3.4:8080"
+    assert normalize_proxy_line("http://u:p@1.1.1.1:8080") == "http://u:p@1.1.1.1:8080"
+    assert normalize_proxy_line("# comment") is None
+    assert normalize_proxy_line("not a proxy") is None
+
+    assert proxy_endpoint("http://u:secret@1.2.3.4:6754") == "1.2.3.4:6754"
+    assert proxy_display("http://u:secret@1.2.3.4:6754") == "http://u:***@1.2.3.4:6754"
+    assert "secret" not in proxy_display("http://u:secret@1.2.3.4:6754")
+
+    from github_register.runner import headless_mode_label, resolve_camoufox_headless
+
+    assert resolve_camoufox_headless(Config(headless=True, virtual_display=False)) is True
+    assert resolve_camoufox_headless(Config(headless=False, virtual_display=True)) == "virtual"
+    assert resolve_camoufox_headless(Config(headless=True, virtual_display=True)) == "virtual"
+    assert headless_mode_label(Config(virtual_display=True)) == "virtual(Xvfb)"
 
     pool_name = "_test_pool_tmp.txt"
     pool_path = runner.ROOT / pool_name
@@ -64,12 +111,17 @@ def test_proxy_pool_pick():
         "http://u:p@1.1.1.1:8080\n"
         "\n"
         "not a proxy line\n"
+        "2.2.2.2:1080:u:p\n"
         "socks5://u:p@2.2.2.2:1080\n",
         encoding="utf-8",
     )
     try:
         pool = load_proxy_pool(pool_name)
-        assert pool == ["http://u:p@1.1.1.1:8080", "socks5://u:p@2.2.2.2:1080"], pool
+        assert pool == [
+            "http://u:p@1.1.1.1:8080",
+            "http://u:p@2.2.2.2:1080",
+            "socks5://u:p@2.2.2.2:1080",
+        ], pool
         cfg = Config(proxy="http://fallback:1@3.3.3.3:80", proxy_file=pool_name)
         assert _pick_proxy_url(cfg) in pool
         cfg2 = Config(proxy="http://fallback:1@3.3.3.3:80", proxy_file="")

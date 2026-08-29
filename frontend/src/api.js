@@ -28,11 +28,11 @@ async function request(method, url, body) {
   return data
 }
 
-async function uploadFile(url, file) {
+async function uploadFile(url, body) {
   const headers = { 'Content-Type': 'text/plain' }
   const token = getToken()
   if (token) headers['X-Access-Key'] = token
-  const resp = await fetch(url, { method: 'POST', headers, body: file })
+  const resp = await fetch(url, { method: 'POST', headers, body })
   if (resp.status === 401 || resp.status === 403) throw new Error('unauthorized')
   const data = await resp.json().catch(() => ({}))
   if (!resp.ok || data.ok === false) throw new Error(data.detail || data.message || `HTTP ${resp.status}`)

@@ -19,7 +19,12 @@ def main() -> int:
     )
     ap.add_argument("--config", default="config.json", help="path to config json")
     ap.add_argument("--count", type=int, default=None, help="override register_count")
-    ap.add_argument("--headless", action="store_true", help="run browsers hidden")
+    ap.add_argument("--headless", action="store_true", help="run browsers hidden (true headless)")
+    ap.add_argument(
+        "--virtual-display",
+        action="store_true",
+        help="Camoufox headless='virtual' (Xvfb) — preferred VPS alternative to --headless",
+    )
     ap.add_argument("--proxy", default="", help="override proxy, e.g. http://user:pass@host:port")
     args = ap.parse_args()
 
@@ -31,8 +36,12 @@ def main() -> int:
     cfg = load_config(cfg_path)
     if args.count is not None:
         cfg.register_count = max(1, args.count)
-    if args.headless:
+    if args.virtual_display:
+        cfg.virtual_display = True
+        cfg.headless = False
+    elif args.headless:
         cfg.headless = True
+        cfg.virtual_display = False
     if args.proxy:
         cfg.proxy = args.proxy
 

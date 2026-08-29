@@ -15,7 +15,6 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
-from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -32,7 +31,7 @@ if str(ROOT) not in sys.path:
 
 from github_register.config import Config, load_config
 from github_register.mailcx import MailCxClient, MailCxError
-from github_register.runner import load_proxy_pool, run_job, silence_playwright_noise
+from github_register.runner import load_proxy_pool, normalize_proxy_line, run_job, silence_playwright_noise
 
 silence_playwright_noise()  # hide TargetClosedError spam when browsers close
 
@@ -147,7 +146,17 @@ def _public_config() -> Dict[str, Any]:
         raw = getattr(cfg, key, "")
         masked[f"has_{key}"] = bool(str(raw or "").strip())
     pf = (getattr(cfg, "proxy_file", "") or "").strip()
-    masked["proxy_file_count"] = len(load_proxy_pool(pf)) if pf else 0
+    pool = load_proxy_pool(pf) if pf else []
+    masked["proxy_file_count"] = len(pool)
+    # Full editable list for UI textarea (user may replace when quota runs out).
+    list_text = ""
+    if pf:
+        path = ROOT / pf
+        if path.is_file():
+            list_text = path.read_text(encoding="utf-8")
+        elif pool:
+            list_text = "\n".join(pool) + "\n"
+    masked["proxy_list_text"] = list_text
     return masked
 
 
@@ -193,6 +202,7 @@ class ConfigBody(BaseModel):
     proxy: Optional[str] = None
     proxy_file: Optional[str] = None
     headless: Optional[bool] = None
+    virtual_display: Optional[bool] = None
     delay_sec: Optional[float] = None
     max_username_tries: Optional[int] = None
     otp_timeout_sec: Optional[int] = None
@@ -202,6 +212,7 @@ class ConfigBody(BaseModel):
     proxy_rate_limit_retries: Optional[int] = None
     create_repo: Optional[bool] = None
     repo_name: Optional[str] = None
+    repo_name_random: Optional[bool] = None
     enable_2fa: Optional[bool] = None
     set_profile_status: Optional[bool] = None
     profile_status: Optional[str] = None
@@ -375,43 +386,65 @@ async def api_litensi_zones(
     return {"ok": True, "zones": zones, "site": site, "cheapest": cheapest}
 
 
-PROXY_SCHEMES = ("http", "https", "socks4", "socks5")
+def _parse_proxy_list(raw: str) -> List[str]:
+    """Normalize pasted/uploaded proxy lines into unique URL forms."""
+    valid: List[str] = []
+    seen: set = set()
+    for line in (raw or "").splitlines():
+        url = normalize_proxy_line(line)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        valid.append(url)
+    return valid
 
 
-def _valid_proxy_line(line: str) -> bool:
-    p = urlsplit(line)
-    return bool(p.hostname) and (p.scheme or "http").lower() in PROXY_SCHEMES
+@app.get("/api/proxy/list")
+async def api_proxy_list(x_access_key: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """Return current proxy pool as editable plaintext (one URL per line)."""
+    _require_auth(x_access_key)
+    cfg = load_config(ROOT / "config.json")
+    name = (cfg.proxy_file or "").strip() or "proxies.txt"
+    path = ROOT / name
+    text = ""
+    if path.is_file():
+        text = path.read_text(encoding="utf-8")
+    pool = load_proxy_pool(name) if name else []
+    return {
+        "ok": True,
+        "proxy_file": name,
+        "count": len(pool),
+        "text": text if text.strip() else "\n".join(pool) + ("\n" if pool else ""),
+    }
 
 
 @app.post("/api/proxy/upload")
 async def api_proxy_upload(
     request: Request, x_access_key: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
-    """Save an uploaded proxy list as the active pool (proxies.txt, one URL per line).
+    """Save an uploaded/pasted proxy list as the active pool (proxies.txt).
 
-    Body: raw file content (text/plain) — no multipart needed.
+    Body: raw file/textarea content (text/plain).
+    Accepts ``scheme://user:pass@host:port`` or ``host:port:user:pass``.
     """
     _require_auth(x_access_key)
     raw = (await request.body()).decode("utf-8", errors="replace")
-    valid: List[str] = []
-    seen: set = set()
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or line in seen or not _valid_proxy_line(line):
-            continue
-        seen.add(line)
-        valid.append(line)
+    valid = _parse_proxy_list(raw)
     if not valid:
         raise HTTPException(
             status_code=400,
-            detail="no valid proxies found (one per line: scheme://user:pass@host:port)",
+            detail=(
+                "no valid proxies found (one per line: "
+                "scheme://user:pass@host:port OR host:port:user:pass)"
+            ),
         )
     pool_name = "proxies.txt"
     (ROOT / pool_name).write_text("\n".join(valid) + "\n", encoding="utf-8")
     cfg = load_config(ROOT / "config.json")
     cfg.proxy_file = pool_name
+    cfg.proxy = ""
     _save_config(cfg)
-    _append_log(f"[*] proxy pool uploaded: {len(valid)} proxies -> {pool_name}")
+    _append_log(f"[*] proxy pool saved: {len(valid)} proxies -> {pool_name}")
     return {"ok": True, "proxy_file": pool_name, "count": len(valid), "config": _public_config()}
 
 

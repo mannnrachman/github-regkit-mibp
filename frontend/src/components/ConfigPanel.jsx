@@ -64,7 +64,7 @@ const REG_FIELDS = [
   },
   {
     key: "proxy",
-    label: "Proxy (http/socks://user:pass@host:port)",
+    label: "Proxy",
     secret: true,
     group: "Registration",
     wide: true,
@@ -72,7 +72,15 @@ const REG_FIELDS = [
   },
   {
     key: "headless",
-    label: "Headless (no browser window, less stable)",
+    label: "Headless (no window — lebih mudah terdeteksi)",
+    type: "checkbox",
+    group: "Registration",
+    wide: true,
+  },
+  {
+    key: "virtual_display",
+    label:
+      "Virtual display / Xvfb (alternatif headless — recommended VPS Linux)",
     type: "checkbox",
     group: "Registration",
     wide: true,
@@ -109,13 +117,24 @@ const ADV_FIELDS = [
 ];
 
 const POST_FIELDS = [
-  { key: "repo_name", label: "Repository name", group: "Post-Signup Stages" },
   {
     key: "create_repo",
     label: "Create first repository after signup",
     type: "checkbox",
     group: "Post-Signup Stages",
     wide: true,
+  },
+  {
+    key: "repo_name_random",
+    label: "Random simple project repo (todo-list, portfolio, …)",
+    type: "checkbox",
+    group: "Post-Signup Stages",
+    wide: true,
+  },
+  {
+    key: "repo_name",
+    label: "Fixed repository name (used when random is off)",
+    group: "Post-Signup Stages",
   },
   {
     key: "enable_2fa",
@@ -133,7 +152,7 @@ const POST_FIELDS = [
   },
   {
     key: "profile_status",
-    label: "Profile status (blank = On vacation)",
+    label: "Profile status (blank = random)",
     group: "Post-Signup Stages",
   },
   {
@@ -452,7 +471,15 @@ function GroupCard({ name, fields, cfg, set }) {
             {f.isProxyField ? (
               <ProxyField f={f} cfg={cfg} set={set} />
             ) : (
-              <Field f={f} value={cfg[f.key]} onChange={(v) => set(f.key, v)} />
+              <Field
+                f={f}
+                value={cfg[f.key]}
+                onChange={(v) => {
+                  if (f.key === "virtual_display" && v) set("headless", false);
+                  if (f.key === "headless" && v) set("virtual_display", false);
+                  set(f.key, v);
+                }}
+              />
             )}
           </div>
         ))}
@@ -464,8 +491,54 @@ function GroupCard({ name, fields, cfg, set }) {
 function ProxyField({ f, cfg, set }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
-  const [poolCount, setPoolCount] = useState(null);
+  const [poolCount, setPoolCount] = useState(
+    () => cfg.proxy_file_count ?? null,
+  );
+  const [listText, setListText] = useState(() => cfg.proxy_list_text || "");
+  const [listLoaded, setListLoaded] = useState(false);
   const mode = cfg.proxy_file ? "file" : "url";
+
+  async function loadList() {
+    try {
+      const d = await api.get("/api/proxy/list");
+      setListText(d.text || "");
+      setPoolCount(d.count ?? 0);
+      setListLoaded(true);
+      if (d.proxy_file) set("proxy_file", d.proxy_file);
+    } catch {
+      // Fall back to whatever came from /api/config
+      if (!listText && cfg.proxy_list_text) setListText(cfg.proxy_list_text);
+      setListLoaded(true);
+    }
+  }
+
+  useEffect(() => {
+    if (mode !== "file") return;
+    // Seed immediately so textarea is never blank while fetch runs
+    if (cfg.proxy_list_text) {
+      setListText(cfg.proxy_list_text);
+      setPoolCount(cfg.proxy_file_count ?? null);
+    }
+    if (!listLoaded) loadList();
+  }, [mode]);
+
+  async function saveList() {
+    setBusy(true);
+    setMsg("");
+    try {
+      const d = await api.upload("/api/proxy/upload", listText);
+      set("proxy_file", d.proxy_file);
+      set("proxy", "");
+      setPoolCount(d.count);
+      setMsg(`✓ ${d.count} proxies saved — ganti baris ini kalau kuota habis`);
+      const again = await api.get("/api/proxy/list").catch(() => null);
+      if (again?.text != null) setListText(again.text);
+    } catch (err) {
+      setMsg("✗ " + err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function onPick(e) {
     const file = e.target.files?.[0];
@@ -474,10 +547,15 @@ function ProxyField({ f, cfg, set }) {
     setBusy(true);
     setMsg("");
     try {
-      const d = await api.upload("/api/proxy/upload", file);
+      const text = await file.text();
+      setListText(text);
+      const d = await api.upload("/api/proxy/upload", text);
       set("proxy_file", d.proxy_file);
+      set("proxy", "");
       setPoolCount(d.count);
-      setMsg(`✓ ${d.count} proxies loaded`);
+      setMsg(`✓ ${d.count} proxies loaded from file`);
+      const again = await api.get("/api/proxy/list").catch(() => null);
+      if (again?.text != null) setListText(again.text);
     } catch (err) {
       setMsg("✗ " + err.message);
     } finally {
@@ -492,7 +570,7 @@ function ProxyField({ f, cfg, set }) {
       : "");
 
   return (
-    <label style={styles.field}>
+    <div style={styles.field}>
       <span style={styles.label}>{f.label}</span>
       <div style={{ ...styles.providerRow, marginBottom: 8 }}>
         <label style={styles.radioLabel}>
@@ -504,6 +582,7 @@ function ProxyField({ f, cfg, set }) {
               set("proxy_file", "");
               setMsg("");
               setPoolCount(null);
+              setListLoaded(false);
             }}
             style={styles.radio}
           />
@@ -521,7 +600,10 @@ function ProxyField({ f, cfg, set }) {
             type="radio"
             name="proxy_mode"
             checked={mode === "file"}
-            onChange={() => set("proxy_file", "proxies.txt")}
+            onChange={() => {
+              set("proxy_file", "proxies.txt");
+              setListLoaded(false);
+            }}
             style={styles.radio}
           />
           <span
@@ -530,19 +612,58 @@ function ProxyField({ f, cfg, set }) {
               fontSize: 13,
             }}
           >
-            File (rotated per account)
+            List (rotated per account)
           </span>
         </label>
       </div>
       {mode === "file" ? (
         <>
-          <input
-            type="file"
-            accept=".txt,text/plain"
+          <textarea
+            value={listText}
+            onChange={(e) => {
+              setListText(e.target.value);
+              setMsg("");
+            }}
+            placeholder={
+              "One proxy per line:\nhttp://user:pass@host:port\nor\nhost:port:user:pass"
+            }
+            rows={10}
             disabled={busy}
-            onChange={onPick}
-            style={{ fontSize: 13, color: "var(--muted)" }}
+            style={styles.proxyTextarea}
+            spellCheck={false}
           />
+          <div style={{ fontSize: 12, color: "var(--muted)", lineHeight: 1.4 }}>
+            Semua proxy pool tampil di sini. Kuota habis? Ganti barisnya lalu{" "}
+            <b style={{ color: "var(--text)" }}>Save proxy list</b>.
+          </div>
+          <div style={styles.inputRow}>
+            <Button
+              type="button"
+              variant="primary"
+              onClick={saveList}
+              disabled={busy || !listText.trim()}
+            >
+              {busy ? "Saving..." : "Save proxy list"}
+            </Button>
+            <label
+              style={{
+                ...styles.radioLabel,
+                margin: 0,
+                padding: "8px 12px",
+                cursor: busy ? "not-allowed" : "pointer",
+                opacity: busy ? 0.6 : 1,
+              }}
+            >
+              <input
+                type="file"
+                accept=".txt,text/plain"
+                disabled={busy}
+                onChange={onPick}
+                style={{ display: "none" }}
+              />
+              <span style={{ fontSize: 13 }}>or upload .txt</span>
+            </label>
+          </div>
           {status && (
             <span
               style={{
@@ -563,7 +684,7 @@ function ProxyField({ f, cfg, set }) {
           style={{ width: "100%" }}
         />
       )}
-    </label>
+    </div>
   );
 }
 
@@ -866,6 +987,21 @@ const styles = {
     color: "var(--muted)",
   },
   label: { fontWeight: 500 },
+  proxyTextarea: {
+    width: "100%",
+    minHeight: 140,
+    padding: "10px 12px",
+    fontSize: 12.5,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+    lineHeight: 1.45,
+    background: "var(--bg-input)",
+    color: "var(--text)",
+    border: "1px solid var(--border)",
+    borderRadius: 8,
+    outline: "none",
+    resize: "vertical",
+    boxSizing: "border-box",
+  },
   inputRow: {
     display: "flex",
     gap: 8,

@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import socket
 import socketserver
 import threading
@@ -25,6 +26,8 @@ from .litensi import LitensiClient, LitensiError
 from .mailcx import MailCxClient, MailCxError
 from .profiles import (
     generate_password,
+    generate_profile_status,
+    generate_repo_name,
     generate_username,
     parse_public_profile,
     username_from_email,
@@ -149,6 +152,54 @@ def _parse_proxy(url: str) -> Optional[dict]:
     return proxy
 
 
+def normalize_proxy_line(line: str) -> Optional[str]:
+    """Accept URL form or ``host:port:user:pass`` → canonical URL, else None."""
+    line = (line or "").strip()
+    if not line or line.startswith("#"):
+        return None
+    p = urlsplit(line)
+    scheme = (p.scheme or "").lower()
+    if p.hostname and scheme in ("http", "https", "socks4", "socks5"):
+        return line
+    # host:port:user:pass  (password may contain ':')
+    parts = line.split(":")
+    if len(parts) >= 4:
+        host, port, user = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        password = ":".join(parts[3:])
+        if host and port.isdigit() and user:
+            return f"http://{user}:{password}@{host}:{port}"
+    return None
+
+
+def proxy_endpoint(url: str) -> str:
+    """``host:port`` from a proxy URL — for logs / matching pool lines."""
+    p = urlsplit((url or "").strip())
+    if not p.hostname:
+        return ""
+    port = p.port or (
+        1080 if (p.scheme or "").lower().startswith("socks")
+        else (443 if (p.scheme or "").lower() == "https" else 80)
+    )
+    return f"{p.hostname}:{port}"
+
+
+def proxy_display(url: str) -> str:
+    """Log-safe proxy label: password masked, host:port kept clear."""
+    url = (url or "").strip()
+    if not url:
+        return "(none)"
+    p = urlsplit(url)
+    if not p.hostname:
+        return url
+    scheme = (p.scheme or "http").lower()
+    port = p.port or (
+        1080 if scheme.startswith("socks") else (443 if scheme == "https" else 80)
+    )
+    if p.username:
+        return f"{scheme}://{p.username}:***@{p.hostname}:{port}"
+    return f"{scheme}://{p.hostname}:{port}"
+
+
 def load_proxy_pool(name: str) -> list[str]:
     """Valid proxy URLs from a pool file in project root (one per line, # comments ok)."""
     path = ROOT / name.strip()
@@ -157,13 +208,13 @@ def load_proxy_pool(name: str) -> list[str]:
     except OSError:
         return []
     out: list[str] = []
+    seen: set[str] = set()
     for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#"):
+        url = normalize_proxy_line(line)
+        if not url or url in seen:
             continue
-        p = urlsplit(line)
-        if p.hostname and (p.scheme or "http").lower() in ("http", "https", "socks4", "socks5"):
-            out.append(line)
+        seen.add(url)
+        out.append(url)
     return out
 
 
@@ -173,10 +224,22 @@ def _pick_proxy_url(cfg: Config, log=None) -> str:
     if name:
         pool = load_proxy_pool(name)
         if pool:
-            return random.choice(pool)
+            chosen = random.choice(pool)
+            if log:
+                log(
+                    f"[*] proxy pick: {proxy_display(chosen)} "
+                    f"(endpoint={proxy_endpoint(chosen)}, pool={len(pool)}, file={name})"
+                )
+            return chosen
         if log:
             log(f"[!] proxy file {name!r} missing/empty — falling back to single proxy URL")
-    return (cfg.proxy or "").strip()
+    single = (cfg.proxy or "").strip()
+    if log:
+        if single:
+            log(f"[*] proxy pick: {proxy_display(single)} (endpoint={proxy_endpoint(single)}, single)")
+        else:
+            log("[*] proxy pick: (none — direct connection)")
+    return single
 
 
 def _proxy_is_socks(proxy: Optional[dict]) -> bool:
@@ -231,6 +294,7 @@ def _socks_exit_ip(url: str, timeout: int = 12) -> str:
 
 _sticky_suffix: Optional[str] = None
 _last_exit_ip: Optional[str] = None
+_last_proxy_url: Optional[str] = None  # last upstream used (for fail logs / reporting)
 
 
 def _ensure_sticky_proxy(url: str, log=None) -> str:
@@ -470,10 +534,11 @@ def _stop_proxy_bridge() -> None:
 
 def _rotate_sticky_proxy() -> None:
     """Discard a blocked DataImpulse sticky port and allocate a new one."""
-    global _sticky_suffix, _last_exit_ip
+    global _sticky_suffix, _last_exit_ip, _last_proxy_url
     _stop_proxy_bridge()
     _sticky_suffix = None
     _last_exit_ip = None
+    _last_proxy_url = None
 
 
 def _disable_blocked_proxy(log) -> None:
@@ -1034,6 +1099,26 @@ def _wait_post_submit(page, context, timeout: int = 120, log=None, stop=None) ->
     )
 
 
+def resolve_camoufox_headless(cfg: Config):
+    """Map config → Camoufox headless arg: True | False | \"virtual\".
+
+    Official Camoufox docs: prefer headless=\"virtual\" (Xvfb) on Linux over
+    true headless, which can still leak as a detection signal.
+    """
+    if getattr(cfg, "virtual_display", False):
+        return "virtual"
+    return bool(getattr(cfg, "headless", False))
+
+
+def headless_mode_label(cfg: Config) -> str:
+    mode = resolve_camoufox_headless(cfg)
+    if mode == "virtual":
+        return "virtual(Xvfb)"
+    if mode is True:
+        return "headless"
+    return "headed"
+
+
 def _browser_ctx_options(cfg: Config, log=None) -> dict:
     """Launch options tuned for DataDome (see 2026 field guides):
 
@@ -1046,6 +1131,7 @@ def _browser_ctx_options(cfg: Config, log=None) -> dict:
     - geoip=True: timezone/locale aligned with the (proxy) exit IP
     - os=host OS: Picasso canvas hash matches the REAL device class we run on
     - headful by default: headless rendering is a Picasso tell
+    - virtual_display: Camoufox headless=\"virtual\" (built-in Xvfb) on Linux VPS
 
     SOCKS proxies: Camoufox's own geoip probe uses plain 'socks5://' which many
     gateways (DataImpulse: '0x02 connection not allowed by ruleset') reject
@@ -1053,8 +1139,19 @@ def _browser_ctx_options(cfg: Config, log=None) -> dict:
     via 'socks5h://' and pass geoip=<ip> so Camoufox skips its probe.
     """
     import platform
+    import shutil
 
-    opts = {"headless": cfg.headless, "humanize": True, "geoip": True}
+    headless_arg = resolve_camoufox_headless(cfg)
+    if headless_arg == "virtual" and not shutil.which("Xvfb"):
+        if log:
+            log(
+                "[!] virtual_display=True but Xvfb not found in PATH — "
+                "install package 'xvfb' or uncheck Virtual display"
+            )
+        raise SignupError("virtual_display requires Xvfb (apt install xvfb)")
+    opts = {"headless": headless_arg, "humanize": True, "geoip": True}
+    if log:
+        log(f"[*] camoufox display mode: {headless_mode_label(cfg)}")
     host_os = platform.system()
     if host_os == "Darwin":
         opts["os"] = "macos"  # canvas/GPU class must match the real machine
@@ -1066,6 +1163,10 @@ def _browser_ctx_options(cfg: Config, log=None) -> dict:
     # IPs mid-session (DataImpulse default) are an instant DataDome flag
     raw_proxy = _pick_proxy_url(cfg, log=log)
     proxy_url = _ensure_sticky_proxy(raw_proxy, log=log) if raw_proxy else ""
+    global _last_proxy_url
+    _last_proxy_url = proxy_url or None
+    if log and proxy_url and proxy_url != raw_proxy:
+        log(f"[*] proxy sticky: {proxy_display(proxy_url)} (endpoint={proxy_endpoint(proxy_url)})")
     proxy = _parse_proxy(proxy_url) if proxy_url else None
     if proxy:
         if _proxy_needs_bridge(proxy):
@@ -1366,15 +1467,17 @@ def _create_repository(page, username: str, base_name: str, log) -> str:
         if "/new" not in url and f"/{username}/" in url:
             log(f"[*] repository created: {url}")
             return name
-        # name conflict? GitHub shows an error — retry with a numeric suffix
+        # name conflict? GitHub shows an error — retry with a short random suffix
         err = ""
         try:
             err = _page_text(page)[:600].lower()
         except Exception:
             pass
         if "already exists" in err and "/new" in url:
-            log(f"[*] repo {name} exists, retry with suffix")
-            name = f"{base_name}{int(time.time()) % 10000}"
+            log(f"[*] repo {name} exists, retry with natural suffix")
+            # Human-looking conflict rename: todo-list-2, portfolio-v2, tools-old
+            suffix = secrets.choice(("2", "v2", "new", "old", "wip", "dev"))
+            name = f"{base_name}-{suffix}"
             page.goto("https://github.com/new", wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_selector("#repository-name-input", state="visible", timeout=20_000)
             page.locator("#repository-name-input").first.fill(name)
@@ -1729,7 +1832,10 @@ def _complete_profile(page, username: str, cfg: Config, log) -> None:
     page.goto(f"https://github.com/{username}", wait_until="domcontentloaded", timeout=60_000)
 
     if cfg.set_profile_status:
-        status = cfg.profile_status.strip() or "On vacation"
+        custom_status = cfg.profile_status.strip()
+        status = custom_status or generate_profile_status()
+        if not custom_status:
+            log(f"[*] profile status (random): {status}")
         # Recording: profile -> react-partial-anchor button "Set status" ->
         # #user-status-status-input -> portal "Set status" submit button.
         # Do not use the preset chip: it is not present on a fresh profile.
@@ -2149,7 +2255,13 @@ def _post_form_flow(
             # ---- stage 4: create first repository ----
             if cfg.create_repo:
                 try:
-                    _create_repository(page, username, cfg.repo_name, log)
+                    repo = (
+                        generate_repo_name()
+                        if getattr(cfg, "repo_name_random", True)
+                        else (cfg.repo_name.strip() or "hello")
+                    )
+                    log(f"[*] creating repository: {repo}")
+                    _create_repository(page, username, repo, log)
                 except Exception as exc:
                     log(f"[i] create repo stage skipped: {exc}")
             # ---- stage 5: enable TOTP 2FA ----
@@ -2172,7 +2284,13 @@ def _post_form_flow(
                 # ---- stage 4: create first repository ----
                 if cfg.create_repo:
                     try:
-                        _create_repository(page, username, cfg.repo_name, log)
+                        repo = (
+                            generate_repo_name()
+                            if getattr(cfg, "repo_name_random", True)
+                            else (cfg.repo_name.strip() or "hello")
+                        )
+                        log(f"[*] creating repository: {repo}")
+                        _create_repository(page, username, repo, log)
                     except Exception as exc:
                         log(f"[i] create repo stage skipped: {exc}")
                 # ---- stage 5: enable TOTP 2FA ----
@@ -2369,7 +2487,11 @@ def register_one(
                 if hard_left <= 0:
                     raise
                 hard_left -= 1
-                log(f"[!] DataDome hard block ({exc}); disabling proxy + rotating, {hard_left} retries left")
+                log(
+                    f"[!] DataDome hard block ({exc}); "
+                    f"proxy={proxy_endpoint(_last_proxy_url) or '(none)'}; "
+                    f"disabling proxy + rotating, {hard_left} retries left"
+                )
                 _disable_blocked_proxy(log)
                 _rotate_sticky_proxy()
                 _sleep_with_cancel(5, stop)
@@ -2377,8 +2499,11 @@ def register_one(
                 if rate_left <= 0:
                     raise
                 rate_left -= 1
-                log(f"[!] GitHub secondary rate limit ({exc}); rotating sticky proxy/IP, "
-                    f"{rate_left} retries left")
+                log(
+                    f"[!] GitHub secondary rate limit ({exc}); "
+                    f"proxy={proxy_endpoint(_last_proxy_url) or '(none)'}; "
+                    f"rotating sticky proxy/IP, {rate_left} retries left"
+                )
                 _rotate_sticky_proxy()
                 _sleep_with_cancel(8, stop)
         # Recovery codes are stored in accounts/recovery/<email-hash>.txt.
@@ -2392,7 +2517,11 @@ def register_one(
     except GitHubRateLimited:
         raise
     except Exception as exc:
-        log(f"[-] account failed: {exc}")
+        ep = proxy_endpoint(_last_proxy_url) if _last_proxy_url else ""
+        if ep:
+            log(f"[-] account failed: {exc} | proxy={ep}")
+        else:
+            log(f"[-] account failed: {exc}")
         return None
     finally:
         if provider == "litensi":
@@ -2431,7 +2560,7 @@ def run_job(
     out = ACCOUNTS_DIR / f"github_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     ok = fail = 0
     log(f"[*] github-regkit | engine=Camoufox (Firefox anti-detect) | mail_provider=mail.cx "
-        f"| headless={cfg.headless} | target={cfg.register_count} | output={out.name}")
+        f"| display={headless_mode_label(cfg)} | target={cfg.register_count} | output={out.name}")
     _emit_progress(ok, fail)  # initial snapshot: 0/0
     try:
         for i in range(1, cfg.register_count + 1):

@@ -18,6 +18,78 @@ _WORDS = [
     "tobin", "ulric", "vance", "wren", "xander", "yates", "zane",
 ]
 
+# Realistic first-repo names — look like small human side projects, not bot slugs.
+_REPO_PROJECTS = [
+    "todo-list",
+    "habit-tracker",
+    "expense-tracker",
+    "markdown-notes",
+    "daily-journal",
+    "bookmark-manager",
+    "url-shortener",
+    "weather-cli",
+    "pomodoro-timer",
+    "simple-calculator",
+    "password-generator",
+    "file-renamer",
+    "image-converter",
+    "csv-cleaner",
+    "json-formatter",
+    "link-board",
+    "reading-list",
+    "flashcards",
+    "quiz-app",
+    "recipe-book",
+    "workout-log",
+    "budget-sheet",
+    "time-tracker",
+    "snippet-vault",
+    "dotfiles",
+    "portfolio",
+    "landing-page",
+    "blog-starter",
+    "api-playground",
+    "hello-world",
+    "learning-python",
+    "learning-go",
+    "rust-exercises",
+    "js-utils",
+    "css-experiments",
+    "react-sandbox",
+    "node-scripts",
+    "shell-helpers",
+    "git-cheatsheet",
+    "study-notes",
+    "interview-prep",
+    "leetcode-notes",
+    "side-project",
+    "weekend-build",
+    "mini-blog",
+    "static-site",
+    "personal-site",
+    "scratchpad",
+    "misc-scripts",
+    "tools",
+]
+
+_PROFILE_STATUSES = [
+    "Focusing",
+    "On vacation",
+    "Out of office",
+    "Working from home",
+    "In a meeting",
+    "Taking a break",
+    "Busy",
+    "Available",
+    "Learning something new",
+    "Shipping code",
+    "Reading docs",
+    "Deep work",
+    "AFK for a bit",
+    "Back soon",
+    "Catching up on PRs",
+]
+
 _USERNAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9]|-(?!-))*[a-z0-9]$")
 
 
@@ -38,6 +110,16 @@ def generate_username() -> str:
     """GitHub-safe username: [a-z0-9-], no consecutive hyphens, <= 39 chars."""
     suffix = "".join(secrets.choice(_LOWER + _DIGITS) for _ in range(6))
     return f"{secrets.choice(_WORDS)}{suffix}"
+
+
+def generate_repo_name() -> str:
+    """Pick a plain project slug that looks like a normal first GitHub repo."""
+    return secrets.choice(_REPO_PROJECTS)
+
+
+def generate_profile_status() -> str:
+    """Pick a normal GitHub status message (not always On vacation)."""
+    return secrets.choice(_PROFILE_STATUSES)
 
 
 def username_from_email(email: str, suffix: str = "") -> str:

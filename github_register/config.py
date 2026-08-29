@@ -20,6 +20,10 @@ class Config:
     proxy: str = ""
     proxy_file: str = ""     # proxy pool file in project root (one URL per line); overrides proxy
     headless: bool = False
+    # Linux VPS: Camoufox headless="virtual" (built-in Xvfb). Preferred over
+    # headless=True — official Camoufox docs recommend virtual display to avoid
+    # headless detection. Overrides headless when True.
+    virtual_display: bool = False
     delay_sec: float = 5.0
     max_username_tries: int = 6
     otp_timeout_sec: int = 240
@@ -32,10 +36,11 @@ class Config:
     proxy_rate_limit_retries: int = 2
     # post-signup stages (from user recording)
     create_repo: bool = True          # stage 4: create first repository
-    repo_name: str = "hello"          # repo name prefix (username-suffix appended on conflict)
+    repo_name: str = "hello"          # used when repo_name_random is False
+    repo_name_random: bool = True     # simple random project name per account
     enable_2fa: bool = True           # stage 5: enable TOTP 2FA and store the secret
     set_profile_status: bool = True
-    profile_status: str = "On vacation"  # blank disables custom status text
+    profile_status: str = ""  # blank = random natural status per account
     complete_profile: bool = True
     profile_name: str = ""            # blank = Random User
     profile_bio: str = ""             # blank = ZenQuotes
