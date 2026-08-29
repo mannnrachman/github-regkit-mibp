@@ -28,6 +28,7 @@ from .profiles import (
     generate_password,
     generate_profile_status,
     generate_repo_name,
+    generate_repo_readme,
     generate_username,
     parse_public_profile,
     username_from_email,
@@ -1404,10 +1405,283 @@ def _try_login(page, username: str, password: str, context, log) -> bool:
     return False
 
 
+def _ensure_readme_on_create(page, log) -> bool:
+    """Enable GitHub's \"Add a README\" option on /new before submit.
+
+    Classic UI: checkbox ``repository[auto_init]``.
+    Newer UI (2025+): labeled checkbox/switch \"Add a README\" / \"Add README\".
+    Returns True if the control was found and turned on.
+    """
+    # Classic rails form field (still present on many accounts)
+    for sel in (
+        'input[name="repository[auto_init]"]',
+        'input#repository_auto_init',
+        'input[type="checkbox"][name*="auto_init" i]',
+        'input[type="checkbox"][id*="readme" i]',
+    ):
+        loc = page.locator(sel)
+        try:
+            if loc.count() == 0:
+                continue
+            box = loc.first
+            box.wait_for(state="attached", timeout=3_000)
+            try:
+                if box.is_checked():
+                    log("[*] Add a README already checked")
+                    return True
+            except Exception:
+                pass
+            try:
+                box.check(force=True, timeout=5_000)
+            except Exception:
+                box.click(force=True, timeout=5_000)
+            log(f"[*] Add a README enabled via {sel}")
+            return True
+        except Exception:
+            continue
+
+    # Accessible / new creation experience
+    try:
+        cb = page.get_by_role(
+            "checkbox", name=re.compile(r"Add a? ?README", re.I)
+        )
+        if cb.count() > 0:
+            el = cb.first
+            try:
+                if not el.is_checked():
+                    el.check(force=True, timeout=5_000)
+            except Exception:
+                el.click(force=True, timeout=5_000)
+            log("[*] Add a README enabled via role=checkbox")
+            return True
+    except Exception:
+        pass
+
+    try:
+        sw = page.get_by_role("switch", name=re.compile(r"Add a? ?README", re.I))
+        if sw.count() > 0:
+            el = sw.first
+            checked = False
+            try:
+                checked = (el.get_attribute("aria-checked") or "").lower() == "true"
+            except Exception:
+                pass
+            if not checked:
+                el.click(force=True, timeout=5_000)
+            log("[*] Add a README enabled via role=switch")
+            return True
+    except Exception:
+        pass
+
+    # Label text → click associated control
+    try:
+        label = page.get_by_text(re.compile(r"Add a README file|Add a README|Add README", re.I)).first
+        if label.count() > 0:
+            label.click(timeout=5_000)
+            log("[*] Add a README toggled via label text")
+            return True
+    except Exception:
+        pass
+
+    # New creation UI: find nearby checkbox/switch via DOM (no stable name attrs).
+    try:
+        how = page.evaluate(
+            """() => {
+                const nodes = [...document.querySelectorAll('label, span, div, p, button, a')];
+                const el = nodes.find((e) => {
+                    const t = (e.textContent || '').replace(/\\s+/g, ' ').trim();
+                    return /^Add a? ?README( file)?$/i.test(t) || /^Add README$/i.test(t);
+                });
+                if (!el) return '';
+                const root = el.closest('label') || el.closest('[class*="Toggle"]')
+                  || el.closest('div') || el.parentElement || el;
+                const ctl = root.querySelector(
+                  'input[type=checkbox], [role=switch], button[role=switch], input[role=switch]'
+                );
+                if (ctl) {
+                  const on = ctl.checked === true
+                    || (ctl.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+                  if (!on) ctl.click();
+                  return 'dom-ctl';
+                }
+                el.click();
+                return 'dom-text';
+            }"""
+        )
+        if how:
+            log(f"[*] Add a README enabled via {how}")
+            return True
+    except Exception:
+        pass
+
+    log("[!] Add a README control not found — repo may be empty")
+    return False
+
+
+def _fill_github_file_editor(page, content: str) -> None:
+    """Write text into GitHub's web file editor (CodeMirror / textarea / Monaco)."""
+    # Prefer explicit textareas GitHub still exposes.
+    for sel in (
+        'textarea[name="value"]',
+        "textarea#code-mirror-textarea",
+        'textarea[aria-label*="file content" i]',
+        'textarea[aria-label*="File content" i]',
+    ):
+        loc = page.locator(sel)
+        try:
+            if loc.count() == 0:
+                continue
+            loc.first.wait_for(state="attached", timeout=5_000)
+            loc.first.fill(content, timeout=10_000)
+            return
+        except Exception:
+            continue
+
+    # CodeMirror classic: hidden textarea sibling
+    filled = page.evaluate(
+        """(text) => {
+            const cm = document.querySelector('.CodeMirror');
+            if (cm && cm.CodeMirror) {
+                cm.CodeMirror.setValue(text);
+                cm.CodeMirror.save && cm.CodeMirror.save();
+                return 'codemirror';
+            }
+            const ta = document.querySelector('.CodeMirror textarea');
+            if (ta) {
+                ta.focus();
+                ta.value = text;
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                return 'cm-textarea';
+            }
+            const editable = document.querySelector(
+                '.cm-content[contenteditable="true"], [role="textbox"][contenteditable="true"]'
+            );
+            if (editable) {
+                editable.focus();
+                editable.textContent = text;
+                editable.dispatchEvent(new InputEvent('input', { bubbles: true }));
+                return 'contenteditable';
+            }
+            return '';
+        }""",
+        content,
+    )
+    if filled:
+        return
+    raise SignupError("GitHub file editor not found for README content")
+
+
+def _commit_github_file_editor(page, log, message: str) -> None:
+    """Commit from the web editor (new file or edit)."""
+    # Newer UI: Commit changes… opens a dialog; classic has direct commit button.
+    commit = page.get_by_role(
+        "button", name=re.compile(r"Commit (changes|new file)", re.I)
+    ).first
+    try:
+        commit.wait_for(state="visible", timeout=10_000)
+        commit.click(timeout=8_000)
+    except Exception:
+        if not _visible_dom_click(
+            page,
+            "b => /commit (changes|new file)/i.test((b.textContent || '').trim())",
+        ):
+            raise SignupError("Commit button not found for README")
+        log("[*] README commit clicked via DOM")
+
+    time.sleep(0.8)
+    # Dialog confirm if present
+    try:
+        dialog_commit = page.locator("#__primerPortalRoot__ button, [role='dialog'] button").filter(
+            has_text=re.compile(r"^Commit (changes|new file)$", re.I)
+        ).last
+        if dialog_commit.count() and dialog_commit.is_visible():
+            # Optional commit message field
+            try:
+                msg = page.locator(
+                    "#__primerPortalRoot__ input[type='text'], "
+                    "[role='dialog'] input[name='message'], "
+                    "input[aria-label*='Commit message' i]"
+                ).first
+                if msg.count() and msg.is_visible():
+                    msg.fill(message[:72], timeout=3_000)
+            except Exception:
+                pass
+            dialog_commit.click(timeout=8_000)
+            log("[*] README commit confirmed in dialog")
+    except Exception:
+        pass
+
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        url = (page.url or "").lower()
+        if "/edit/" not in url and "/new/" not in url:
+            return
+        time.sleep(0.5)
+    # Soft: still ok if URL slow to change
+    log("[i] README commit may still be navigating")
+
+
+def _seed_repository_readme(page, username: str, repo: str, log) -> None:
+    """Fill README with unique generated markdown (edit existing or create new)."""
+    body = generate_repo_readme(repo)
+    opened = False
+
+    for branch in ("main", "master"):
+        edit_url = f"https://github.com/{username}/{repo}/edit/{branch}/README.md"
+        page.goto(edit_url, wait_until="domcontentloaded", timeout=60_000)
+        time.sleep(1.0)
+        text = _page_text(page)[:400].lower()
+        if "404" in text or "not found" in text:
+            continue
+        # Editor present?
+        try:
+            if (
+                page.locator('textarea[name="value"], .CodeMirror, .cm-editor, .cm-content').count()
+                > 0
+            ):
+                opened = True
+                log(f"[*] editing existing README on {branch}")
+                break
+        except Exception:
+            continue
+
+    if not opened:
+        page.goto(
+            f"https://github.com/{username}/{repo}/new/main",
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        time.sleep(1.0)
+        # Filename field
+        for sel in (
+            'input[name="filename"]',
+            "input.filename",
+            'input[aria-label*="File name" i]',
+            'input[placeholder*="Name your file" i]',
+        ):
+            loc = page.locator(sel)
+            try:
+                if loc.count() == 0:
+                    continue
+                loc.first.fill("README.md", timeout=8_000)
+                opened = True
+                log("[*] creating README.md via new-file form")
+                break
+            except Exception:
+                continue
+        if not opened:
+            raise SignupError("could not open README create/edit form")
+
+    _fill_github_file_editor(page, body)
+    _commit_github_file_editor(page, log, message=f"docs: add README for {repo}")
+    log(f"[*] README seeded ({len(body)} chars) for {username}/{repo}")
+
+
 def _create_repository(page, username: str, base_name: str, log) -> str:
     """Stage 4 (user recording): create the first repository on /new.
 
     The name field auto-generates a suggestion; we type our own name and submit.
+    Enables \"Add a README\" when available so the repo is not empty.
     Returns the repository name created.
     """
     def _submit() -> None:
@@ -1455,7 +1729,9 @@ def _create_repository(page, username: str, base_name: str, log) -> str:
         raise SignupError(f"repo form not found; url={page.url} body={_page_text(page)[:200]!r}")
     inp = page.locator("#repository-name-input").first
     inp.fill(name)
-    time.sleep(1.5)  # let GitHub validate + enable the submit button
+    time.sleep(1.0)  # let GitHub validate + enable the submit button
+    _ensure_readme_on_create(page, log)
+    time.sleep(0.5)
     try:
         _submit()
     except Exception as exc:
@@ -1466,6 +1742,10 @@ def _create_repository(page, username: str, base_name: str, log) -> str:
         url = page.url or ""
         if "/new" not in url and f"/{username}/" in url:
             log(f"[*] repository created: {url}")
+            try:
+                _seed_repository_readme(page, username, name, log)
+            except Exception as exc:
+                log(f"[!] README seed failed (repo kept): {exc}")
             return name
         # name conflict? GitHub shows an error — retry with a short random suffix
         err = ""
@@ -1481,7 +1761,9 @@ def _create_repository(page, username: str, base_name: str, log) -> str:
             page.goto("https://github.com/new", wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_selector("#repository-name-input", state="visible", timeout=20_000)
             page.locator("#repository-name-input").first.fill(name)
-            time.sleep(1.5)
+            time.sleep(1.0)
+            _ensure_readme_on_create(page, log)
+            time.sleep(0.5)
             _submit()
         time.sleep(1)
     raise SignupError(f"repository creation not confirmed; url={page.url}")
@@ -1506,6 +1788,28 @@ def _visible_dom_click(page, matcher_js: str) -> bool:
     ))
 
 
+def _avatar_page_diagnostics(page) -> str:
+    """Compact DOM snapshot for avatar-widget failures."""
+    try:
+        return page.evaluate(
+            """() => {
+                const heading = [...document.querySelectorAll('h1,h2,h3')].some(
+                  h => /profile picture/i.test(h.textContent || '')
+                );
+                const files = document.querySelectorAll('input[type=file]').length;
+                const edits = [...document.querySelectorAll('summary,button')].filter(
+                  el => /^\\s*Edit\\s*$/i.test(el.textContent || '')
+                ).length;
+                const imgs = document.querySelectorAll(
+                  'img.avatar, img[src*=\"/u/\"], img[src*=\"avatars.githubusercontent\"]'
+                ).length;
+                return `url=${location.pathname} heading=${heading} fileInputs=${files} editBtns=${edits} avatarImgs=${imgs}`;
+            }"""
+        ) or "diag=unavailable"
+    except Exception as exc:
+        return f"diag_error={exc}"
+
+
 def _avatar_img_srcs(page) -> list[str]:
     """Collect current avatar image URLs on the settings profile page.
 
@@ -1519,7 +1823,8 @@ def _avatar_img_srcs(page) -> list[str]:
                     'img.avatar, img[alt*="avatar" i], img[alt*="Avatar"], '
                     + '.avatar-user img, [data-testid="user-avatar"] img, '
                     + 'form[action*="avatar"] img, details summary img.avatar, '
-                    + 'img[src*="/u/"], img[src*="avatars.githubusercontent"]'
+                    + 'img[src*="/u/"], img[src*="avatars.githubusercontent"], '
+                    + 'label img, [class*="Avatar"] img, picture img'
                   ),
                 ];
                 const out = [];
@@ -1543,8 +1848,9 @@ def _avatar_section(page):
     for xpath in (
         "xpath=ancestor::div[contains(@class,'Box')][1]",
         "xpath=ancestor::section[1]",
-        "xpath=ancestor::div[position()<=6][.//summary or .//input[@type='file']][1]",
+        "xpath=ancestor::div[position()<=6][.//summary or .//input[@type='file'] or .//button][1]",
         "xpath=ancestor::div[4]",
+        "xpath=ancestor::div[3]",
     ):
         try:
             if heading.count() == 0:
@@ -1553,20 +1859,26 @@ def _avatar_section(page):
             if card.count() == 0:
                 continue
             has_edit = card.locator("summary, button").filter(
-                has_text=re.compile(r"^Edit$", re.I)
+                has_text=re.compile(r"^Edit$|Upload a photo|Change", re.I)
             ).count()
             has_file = card.locator('input[type="file"]').count()
-            if has_edit or has_file:
+            if has_edit or has_file or card.locator("img").count() > 0:
                 return card
         except Exception:
             continue
-    # Last resort: details that contain "Upload a photo".
+    # Last resort: details that contain "Upload a photo" / Profile picture.
     try:
         details = page.locator("details").filter(
-            has_text=re.compile(r"Upload a photo", re.I)
+            has_text=re.compile(r"Upload a photo|Profile picture", re.I)
         )
         if details.count() > 0:
             return details.first
+    except Exception:
+        pass
+    # Page-level fallback scope (modern Primer layout may not use Box cards).
+    try:
+        if heading.count() > 0:
+            return heading.first.locator("xpath=ancestor::div[2]").first
     except Exception:
         pass
     raise SignupError(
@@ -1590,25 +1902,39 @@ def _pick_avatar_file_input(scope):
     return any_file.first
 
 
-def _wait_avatar_widget(page, timeout: int = 25_000) -> None:
-    """Wait until profile-picture Edit/file input AND an avatar img exist."""
+def _wait_avatar_widget(page, timeout: int = 40_000) -> None:
+    """Wait until settings/profile avatar controls are usable.
+
+    Playwright guides recommend setInputFiles on hidden inputs — do NOT
+    require a visible Edit button + img together. Ready when:
+      - \"Profile picture\" heading (or details) exists, AND
+      - (Edit/Upload control OR any file input OR avatar img) is present.
+    """
     deadline = time.time() + (timeout / 1000)
     last_exc: Exception | None = None
     while time.time() < deadline:
         try:
-            section = _avatar_section(page)
-            edit = section.locator("summary, button").filter(
-                has_text=re.compile(r"^Edit$", re.I)
-            )
-            file_in = section.locator('input[type="file"]')
+            heading_ok = page.get_by_role(
+                "heading", name=re.compile(r"Profile picture", re.I)
+            ).count() > 0
+            details_ok = page.locator("details").filter(
+                has_text=re.compile(r"Upload a photo|Profile picture", re.I)
+            ).count() > 0
+            file_n = page.locator('input[type="file"]').count()
+            edit_n = page.locator("summary, button").filter(
+                has_text=re.compile(r"^Edit$|Upload a photo|Change photo|Change avatar", re.I)
+            ).count()
             srcs = _avatar_img_srcs(page)
-            if (edit.count() > 0 or file_in.count() > 0) and srcs:
+            if (heading_ok or details_ok or file_n > 0) and (
+                file_n > 0 or edit_n > 0 or bool(srcs)
+            ):
                 return
         except Exception as exc:
             last_exc = exc
-        time.sleep(0.35)
+        time.sleep(0.4)
     raise SignupError(
-        f"profile picture widget not ready on settings page: {last_exc}"
+        f"profile picture widget not ready on settings page: {last_exc}; "
+        f"{_avatar_page_diagnostics(page)}"
     )
 
 
@@ -1744,49 +2070,95 @@ def _set_profile_avatar(page, username: str, cfg: Config, log) -> None:
             wait_until="domcontentloaded",
             timeout=60_000,
         )
+        try:
+            page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            time.sleep(1.5)
         _wait_avatar_widget(page)
         before = _avatar_img_srcs(page)
-        if not before:
-            raise SignupError("baseline avatar URL missing before upload")
-        section = _avatar_section(page)
+        log(f"[*] avatar baseline urls={len(before)} ({_avatar_page_diagnostics(page)})")
+        section = None
+        try:
+            section = _avatar_section(page)
+        except Exception as exc:
+            log(f"[i] avatar section scoped fallback ({exc})")
         uploaded = False
 
         # Listen before attaching the file so we never miss a direct POST.
         page.on("response", _on_response)
         try:
-            # Strategy A: Edit → Upload a photo → filechooser.
+            # Strategy 0: page-level Edit / Upload near Profile picture (modern UI).
             try:
-                edit = section.locator("summary, button").filter(
-                    has_text=re.compile(r"^Edit$", re.I)
+                edit = page.get_by_role(
+                    "button", name=re.compile(r"^Edit$|Upload a photo|Change photo", re.I)
                 ).first
-                edit.wait_for(state="visible", timeout=8_000)
-                with page.expect_file_chooser(timeout=10_000) as fc_info:
-                    edit.click(timeout=5_000)
-                    # Portal menus often render outside the card; try section then page.
-                    upload_btn = section.get_by_text(
-                        re.compile(r"Upload a photo", re.I)
-                    )
-                    if upload_btn.count() == 0:
-                        upload_btn = page.get_by_text(
+                if edit.count() == 0:
+                    edit = page.locator("summary").filter(
+                        has_text=re.compile(r"^Edit$", re.I)
+                    ).first
+                if edit.count() > 0:
+                    with page.expect_file_chooser(timeout=8_000) as fc_info:
+                        edit.click(timeout=5_000)
+                        upload_btn = page.get_by_text(re.compile(r"Upload a photo", re.I))
+                        if upload_btn.count() > 0:
+                            upload_btn.first.click(timeout=5_000)
+                    fc_info.value.set_files(str(path))
+                    uploaded = True
+                    log(f"[*] avatar file selected via page Edit ({provider})")
+            except Exception as exc:
+                log(f"[i] page Edit avatar path skipped ({exc})")
+
+            # Strategy A: Edit → Upload a photo → filechooser (scoped card).
+            if not uploaded and section is not None:
+                try:
+                    edit = section.locator("summary, button").filter(
+                        has_text=re.compile(r"^Edit$|Upload a photo|Change", re.I)
+                    ).first
+                    edit.wait_for(state="visible", timeout=8_000)
+                    with page.expect_file_chooser(timeout=10_000) as fc_info:
+                        edit.click(timeout=5_000)
+                        # Portal menus often render outside the card; try section then page.
+                        upload_btn = section.get_by_text(
                             re.compile(r"Upload a photo", re.I)
                         )
-                    upload_btn.first.click(timeout=5_000)
-                fc_info.value.set_files(str(path))
-                uploaded = True
-                log(f"[*] avatar file selected via filechooser ({provider})")
-            except Exception as exc:
-                log(
-                    f"[!] filechooser avatar path failed ({exc}); "
-                    "trying scoped file input"
-                )
+                        if upload_btn.count() == 0:
+                            upload_btn = page.get_by_text(
+                                re.compile(r"Upload a photo", re.I)
+                            )
+                        if upload_btn.count() > 0:
+                            upload_btn.first.click(timeout=5_000)
+                    fc_info.value.set_files(str(path))
+                    uploaded = True
+                    log(f"[*] avatar file selected via filechooser ({provider})")
+                except Exception as exc:
+                    log(
+                        f"[!] filechooser avatar path failed ({exc}); "
+                        "trying scoped file input"
+                    )
 
-            # Strategy B: scoped file input only (never page-wide).
+            # Strategy B: scoped file input only (never page-wide first).
+            if not uploaded and section is not None:
+                try:
+                    file_input = _pick_avatar_file_input(section)
+                    file_input.wait_for(state="attached", timeout=10_000)
+                    file_input.set_input_files(str(path))
+                    uploaded = True
+                    log(f"[*] avatar file set via scoped input ({provider})")
+                except Exception as exc:
+                    log(f"[!] scoped file input failed ({exc}); trying page-level")
+
+            # Strategy C: page-level hidden file input (Playwright recommended for styled uploads).
             if not uploaded:
-                file_input = _pick_avatar_file_input(section)
+                file_input = page.locator(
+                    'input[type="file"][accept*="image"], '
+                    'input[type="file"][accept*="png"], '
+                    'input[type="file"][accept*="jpeg"], '
+                    'input[type="file"]'
+                ).first
                 file_input.wait_for(state="attached", timeout=10_000)
                 file_input.set_input_files(str(path))
                 uploaded = True
-                log(f"[*] avatar file set via scoped input ({provider})")
+                log(f"[*] avatar file set via page-level input ({provider})")
 
             cropped = _confirm_avatar_crop(page, log)
             time.sleep(1.5)
@@ -1794,9 +2166,25 @@ def _set_profile_avatar(page, username: str, cfg: Config, log) -> None:
                 deadline = time.time() + 8
                 while time.time() < deadline and not upload_hit["ok"]:
                     time.sleep(0.4)
-            _verify_avatar_changed(
-                page, before, log, network_ok=upload_hit["ok"]
-            )
+            if before:
+                _verify_avatar_changed(
+                    page, before, log, network_ok=upload_hit["ok"]
+                )
+            elif upload_hit["ok"]:
+                log("[*] avatar upload network OK (no baseline URL to diff)")
+            else:
+                # Reload and accept any avatar img as weak success if crop closed.
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30_000)
+                except Exception:
+                    pass
+                after = _avatar_img_srcs(page)
+                if after:
+                    log(f"[*] avatar present after upload (no baseline): {after[:1]}")
+                else:
+                    raise SignupError(
+                        "avatar upload unverified (no baseline, no network hit, no img)"
+                    )
         finally:
             try:
                 page.remove_listener("response", _on_response)

@@ -117,6 +117,96 @@ def generate_repo_name() -> str:
     return secrets.choice(_REPO_PROJECTS)
 
 
+_README_TAGLINES = [
+    "Small personal project I use day to day.",
+    "Scratch space while learning and experimenting.",
+    "Tiny utility — expect rough edges.",
+    "Weekend build; docs may lag behind the code.",
+    "Notes and helpers collected in one place.",
+    "Practice repo — structure will change.",
+    "Simple tools without heavy dependencies.",
+    "Work-in-progress. Feedback welcome.",
+]
+
+_README_FEATURES = [
+    "Keeps a short local config",
+    "CLI-friendly defaults",
+    "No external account required",
+    "Works offline once set up",
+    "Easy to fork and tweak",
+    "Minimal dependencies",
+    "Readable source layout",
+    "Basic error messages",
+    "Sample data included",
+    "Simple test commands",
+]
+
+_README_STACKS = [
+    "Python 3",
+    "Node.js",
+    "Bash",
+    "TypeScript",
+    "Go",
+    "Rust",
+    "plain HTML/CSS",
+    "Make + shell",
+]
+
+_README_GETTING_STARTED = [
+    "Clone the repo and skim the files before running anything.",
+    "Install dependencies for your stack, then try the sample command below.",
+    "Copy any example config, edit paths, and run from the project root.",
+    "Open the main script and adjust constants for your machine.",
+]
+
+
+def generate_repo_readme(repo_name: str) -> str:
+    """Unique-looking README body so a new repo does not look empty/identical."""
+    import datetime as _dt
+
+    title = (repo_name or "project").replace("-", " ").replace("_", " ").strip().title()
+    tagline = secrets.choice(_README_TAGLINES)
+    features = secrets.SystemRandom().sample(_README_FEATURES, k=secrets.choice((3, 4, 5)))
+    stacks = secrets.SystemRandom().sample(_README_STACKS, k=secrets.choice((2, 3)))
+    started = secrets.choice(_README_GETTING_STARTED)
+    year = _dt.datetime.now().year
+    feature_lines = "\n".join(f"- {f}" for f in features)
+    stack_lines = ", ".join(stacks)
+    cmd = secrets.choice(
+        (
+            "python main.py --help",
+            "npm start",
+            "./run.sh",
+            "make demo",
+            "go run .",
+        )
+    )
+    license_note = secrets.choice(
+        (
+            "Personal use for now — license TBD.",
+            "MIT when I get around to adding a LICENSE file.",
+            "Use freely; no warranty.",
+        )
+    )
+    return (
+        f"# {title}\n\n"
+        f"{tagline}\n\n"
+        f"## Features\n\n"
+        f"{feature_lines}\n\n"
+        f"## Stack\n\n"
+        f"{stack_lines}\n\n"
+        f"## Getting started\n\n"
+        f"{started}\n\n"
+        f"```bash\n"
+        f"{cmd}\n"
+        f"```\n\n"
+        f"## Notes\n\n"
+        f"- Repo name: `{repo_name}`\n"
+        f"- Started around {year}\n"
+        f"- {license_note}\n"
+    )
+
+
 def generate_profile_status() -> str:
     """Pick a normal GitHub status message (not always On vacation)."""
     return secrets.choice(_PROFILE_STATUSES)

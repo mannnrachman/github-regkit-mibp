@@ -52,6 +52,17 @@ def test_generate_repo_name():
         assert not re.search(r"-[0-9a-f]{4}$", name)
 
 
+def test_generate_repo_readme():
+    from github_register.profiles import generate_repo_readme
+
+    a = generate_repo_readme("todo-list")
+    b = generate_repo_readme("todo-list")
+    assert a.startswith("# Todo List")
+    assert "## Features" in a and "## Stack" in a
+    assert "todo-list" in a
+    assert a != b or len(a) > 80
+
+
 def test_generate_profile_status():
     from github_register.profiles import _PROFILE_STATUSES, generate_profile_status
 
@@ -164,11 +175,12 @@ def test_avatar_normalize_and_providers():
         write_temp_avatar,
     )
 
-    assert resolve_providers(None) == ["dicebear", "nekos", "waifu_im"]
+    assert resolve_providers(None) == ["dicebear", "nekos"]
     assert resolve_providers(["waifu", "dicebear", "dicebear", "nope"]) == [
         "waifu_im",
         "dicebear",
     ]
+    assert resolve_providers(["nekos"]) == ["nekos"]
 
     assert requests_proxies("") is None
     socks = requests_proxies("socks5://u:p@1.2.3.4:1080")

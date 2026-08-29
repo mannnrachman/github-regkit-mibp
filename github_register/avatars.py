@@ -15,7 +15,7 @@ from PIL import Image
 _USER_AGENT = "GitHubRegKit (https://github.com/mannnrachman/github-regkit-mibp)"
 _HEADERS = {"User-Agent": _USER_AGENT, "Accept": "*/*"}
 
-DEFAULT_PROVIDERS: tuple[str, ...] = ("dicebear", "nekos", "waifu_im")
+DEFAULT_PROVIDERS: tuple[str, ...] = ("dicebear", "nekos")
 _AVATAR_SIZE = 500
 _MAX_BYTES = 950_000  # stay under GitHub's 1 MB hard limit
 
@@ -128,10 +128,11 @@ def fetch_waifu_im(
     """Random SFW image from waifu.im (exclude common suggestive tags)."""
     s = session or _session(proxy_url)
     meta = s.get(
-        "https://api.waifu.im/images",
+        "https://api.waifu.im/search",
         params={
-            "IsNsfw": "False",
-            "ExcludedTags": "oppai,ass,erotic",
+            "is_nsfw": "false",
+            "excluded_tags": "oppai,ass,erotic",
+            "limit": "1",
         },
         timeout=25,
     )

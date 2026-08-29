@@ -28,5 +28,5 @@
   "profile_bio": "",
   "profile_location": "",
   "set_profile_avatar": true,
-  "avatar_providers": ["dicebear", "nekos", "waifu_im"]
+  "avatar_providers": ["dicebear", "nekos"]
 }
