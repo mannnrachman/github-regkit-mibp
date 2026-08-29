@@ -2087,78 +2087,72 @@ def _set_profile_avatar(page, username: str, cfg: Config, log) -> None:
         # Listen before attaching the file so we never miss a direct POST.
         page.on("response", _on_response)
         try:
-            # Strategy 0: page-level Edit / Upload near Profile picture (modern UI).
+            # Strategy 1 (primary): page-level hidden file input.
+            # Modern GitHub settings almost always exposes one image input; this
+            # path already succeeds in production and avoids Edit/filechooser
+            # timeouts (~8s) on layouts without a visible Edit control.
             try:
-                edit = page.get_by_role(
-                    "button", name=re.compile(r"^Edit$|Upload a photo|Change photo", re.I)
-                ).first
-                if edit.count() == 0:
-                    edit = page.locator("summary").filter(
-                        has_text=re.compile(r"^Edit$", re.I)
-                    ).first
-                if edit.count() > 0:
-                    with page.expect_file_chooser(timeout=8_000) as fc_info:
-                        edit.click(timeout=5_000)
-                        upload_btn = page.get_by_text(re.compile(r"Upload a photo", re.I))
-                        if upload_btn.count() > 0:
-                            upload_btn.first.click(timeout=5_000)
-                    fc_info.value.set_files(str(path))
-                    uploaded = True
-                    log(f"[*] avatar file selected via page Edit ({provider})")
-            except Exception as exc:
-                log(f"[i] page Edit avatar path skipped ({exc})")
-
-            # Strategy A: Edit → Upload a photo → filechooser (scoped card).
-            if not uploaded and section is not None:
-                try:
-                    edit = section.locator("summary, button").filter(
-                        has_text=re.compile(r"^Edit$|Upload a photo|Change", re.I)
-                    ).first
-                    edit.wait_for(state="visible", timeout=8_000)
-                    with page.expect_file_chooser(timeout=10_000) as fc_info:
-                        edit.click(timeout=5_000)
-                        # Portal menus often render outside the card; try section then page.
-                        upload_btn = section.get_by_text(
-                            re.compile(r"Upload a photo", re.I)
-                        )
-                        if upload_btn.count() == 0:
-                            upload_btn = page.get_by_text(
-                                re.compile(r"Upload a photo", re.I)
-                            )
-                        if upload_btn.count() > 0:
-                            upload_btn.first.click(timeout=5_000)
-                    fc_info.value.set_files(str(path))
-                    uploaded = True
-                    log(f"[*] avatar file selected via filechooser ({provider})")
-                except Exception as exc:
-                    log(
-                        f"[!] filechooser avatar path failed ({exc}); "
-                        "trying scoped file input"
-                    )
-
-            # Strategy B: scoped file input only (never page-wide first).
-            if not uploaded and section is not None:
-                try:
-                    file_input = _pick_avatar_file_input(section)
-                    file_input.wait_for(state="attached", timeout=10_000)
-                    file_input.set_input_files(str(path))
-                    uploaded = True
-                    log(f"[*] avatar file set via scoped input ({provider})")
-                except Exception as exc:
-                    log(f"[!] scoped file input failed ({exc}); trying page-level")
-
-            # Strategy C: page-level hidden file input (Playwright recommended for styled uploads).
-            if not uploaded:
                 file_input = page.locator(
                     'input[type="file"][accept*="image"], '
                     'input[type="file"][accept*="png"], '
                     'input[type="file"][accept*="jpeg"], '
                     'input[type="file"]'
                 ).first
-                file_input.wait_for(state="attached", timeout=10_000)
-                file_input.set_input_files(str(path))
-                uploaded = True
-                log(f"[*] avatar file set via page-level input ({provider})")
+                if file_input.count() > 0:
+                    file_input.wait_for(state="attached", timeout=5_000)
+                    file_input.set_input_files(str(path))
+                    uploaded = True
+                    log(f"[*] avatar file set via page-level input ({provider})")
+            except Exception as exc:
+                log(f"[i] page-level avatar input skipped ({exc})")
+
+            # Strategy 2: scoped file input inside Profile picture card.
+            if not uploaded and section is not None:
+                try:
+                    file_input = _pick_avatar_file_input(section)
+                    if file_input.count() > 0:
+                        file_input.wait_for(state="attached", timeout=5_000)
+                        file_input.set_input_files(str(path))
+                        uploaded = True
+                        log(f"[*] avatar file set via scoped input ({provider})")
+                except Exception as exc:
+                    log(f"[i] scoped avatar input skipped ({exc})")
+
+            # Strategy 3 (fallback): Edit / Upload → filechooser.
+            # Fail fast when controls are absent (no long wait_for).
+            if not uploaded:
+                try:
+                    edit = page.get_by_role(
+                        "button",
+                        name=re.compile(r"^Edit$|Upload a photo|Change photo", re.I),
+                    ).first
+                    if edit.count() == 0:
+                        edit = page.locator("summary").filter(
+                            has_text=re.compile(r"^Edit$", re.I)
+                        ).first
+                    if edit.count() == 0 and section is not None:
+                        edit = section.locator("summary, button").filter(
+                            has_text=re.compile(r"^Edit$|Upload a photo|Change", re.I)
+                        ).first
+                    if edit.count() == 0:
+                        raise SignupError("no Edit/Upload control for avatar filechooser")
+                    with page.expect_file_chooser(timeout=5_000) as fc_info:
+                        edit.click(timeout=3_000)
+                        upload_btn = page.get_by_text(re.compile(r"Upload a photo", re.I))
+                        if section is not None and upload_btn.count() == 0:
+                            upload_btn = section.get_by_text(
+                                re.compile(r"Upload a photo", re.I)
+                            )
+                        if upload_btn.count() > 0:
+                            upload_btn.first.click(timeout=3_000)
+                    fc_info.value.set_files(str(path))
+                    uploaded = True
+                    log(f"[*] avatar file selected via filechooser ({provider})")
+                except Exception as exc:
+                    log(f"[i] filechooser avatar path skipped ({exc})")
+
+            if not uploaded:
+                raise SignupError("avatar file input not found on settings/profile")
 
             cropped = _confirm_avatar_crop(page, log)
             time.sleep(1.5)
