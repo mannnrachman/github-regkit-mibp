@@ -345,22 +345,30 @@ export default function AccountsPanel({ group = '', onClearGroup, onGroupsChange
           </div>
         </div>
 
-        {!group && files.length > 1 && (
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-            {files.slice(0, 8).map((f) => {
-              const active = currentName === f.name
-              return (
-                <Button
-                  key={f.name}
-                  size="sm"
-                  variant={active ? 'primary' : 'outline'}
-                  onClick={() => setSelected(f.name)}
-                >
-                  {f.name.replace('github_accounts_', '').replace('.txt', '')}
-                  <span style={{ color: 'var(--muted)', marginLeft: 4 }}>{fmtSize(f.size)}</span>
-                </Button>
-              )
-            })}
+        {!group && files.length > 0 && (
+          <div style={styles.filePicker}>
+            <label htmlFor="accounts-file-select" style={styles.filePickerLabel}>
+              File akun
+            </label>
+            <select
+              id="accounts-file-select"
+              className="ui-input"
+              style={styles.fileSelect}
+              value={currentName}
+              onChange={(e) => setSelected(e.target.value)}
+            >
+              {files.map((f) => {
+                const label = f.name.replace(/^github_accounts_/, '').replace(/\.txt$/, '')
+                return (
+                  <option key={f.name} value={f.name}>
+                    {label} · {fmtSize(f.size)}
+                  </option>
+                )
+              })}
+            </select>
+            <span style={styles.filePickerMeta}>
+              {files.length} file
+            </span>
           </div>
         )}
       </Card>
@@ -405,6 +413,7 @@ export default function AccountsPanel({ group = '', onClearGroup, onGroupsChange
                     <td style={styles.tdMono}>
                       <CopyCell
                         value={r.username}
+                        href={r.username ? `https://github.com/${encodeURIComponent(r.username)}` : undefined}
                         onCopy={() => copyValue(r.username, 'Username')}
                       />
                     </td>
@@ -608,8 +617,9 @@ export default function AccountsPanel({ group = '', onClearGroup, onGroupsChange
  * When `masked` is true the text is dots by default; click text to toggle
  * visibility. Clicking the button always copies the REAL value regardless of
  * mask state, so users don't have to reveal the password to copy it.
+ * Optional `href` turns the visible text into an external link (e.g. GitHub).
  */
-function CopyCell({ value, onCopy, masked = false }) {
+function CopyCell({ value, onCopy, masked = false, href }) {
   const [show, setShow] = useState(!masked)
   const [copied, setCopied] = useState(false)
   const text = String(value ?? '')
@@ -622,19 +632,34 @@ function CopyCell({ value, onCopy, masked = false }) {
     setTimeout(() => setCopied(false), 900)
   }
 
+  const textNode = display || <span style={{ color: 'var(--muted)' }}>—</span>
+
   return (
     <span style={styles.copyCell}>
-      <span
-        style={{
-          ...styles.copyText,
-          cursor: masked ? 'pointer' : 'default',
-          userSelect: masked && !show ? 'none' : 'text',
-        }}
-        onClick={masked ? () => setShow((v) => !v) : undefined}
-        title={masked ? (show ? 'Click to hide' : 'Click to show') : undefined}
-      >
-        {display || <span style={{ color: 'var(--muted)' }}>—</span>}
-      </span>
+      {href && text && !(masked && !show) ? (
+        <a
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ ...styles.copyLink }}
+          className="copy-cell-link"
+          title={`Buka ${href}`}
+        >
+          {textNode}
+        </a>
+      ) : (
+        <span
+          style={{
+            ...styles.copyText,
+            cursor: masked ? 'pointer' : 'default',
+            userSelect: masked && !show ? 'none' : 'text',
+          }}
+          onClick={masked ? () => setShow((v) => !v) : undefined}
+          title={masked ? (show ? 'Click to hide' : 'Click to show') : undefined}
+        >
+          {textNode}
+        </span>
+      )}
       {text && (
         <button
           type="button"
@@ -670,6 +695,31 @@ function TableSkeleton() {
 
 const styles = {
   wrap: { display: 'flex', flexDirection: 'column', gap: 14, flex: 1, maxWidth: 1100, width: '100%', margin: '0 auto', minHeight: 0 },
+  filePicker: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    flexWrap: 'wrap',
+    paddingTop: 4,
+  },
+  filePickerLabel: {
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+    color: 'var(--muted)',
+    flexShrink: 0,
+  },
+  fileSelect: {
+    flex: '1 1 280px',
+    maxWidth: 420,
+    minWidth: 200,
+    cursor: 'pointer',
+  },
+  filePickerMeta: {
+    fontSize: 12,
+    color: 'var(--muted)',
+  },
   table: { width: '100%', borderCollapse: 'collapse' },
   th: {
     textAlign: 'left', padding: '12px 16px', fontSize: 11, fontWeight: 700,
@@ -696,6 +746,17 @@ const styles = {
     whiteSpace: 'nowrap',
     maxWidth: 240,
     verticalAlign: 'middle',
+  },
+  copyLink: {
+    display: 'inline-block',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+    maxWidth: 240,
+    verticalAlign: 'middle',
+    color: 'var(--accent)',
+    textDecoration: 'none',
+    fontWeight: 600,
   },
   overlay: {
     position: 'fixed', inset: 0, zIndex: 998,
@@ -758,6 +819,11 @@ const accountsCSS = `
     border-color: rgba(var(--accent-rgb),0.40);
   }
   .copy-btn:active { transform: scale(0.9); }
+
+  a.copy-link-hover:hover,
+  .copy-cell-link:hover {
+    text-decoration: underline;
+  }
 
   /* loading spinner — teal ring */
   .acc-spinner {
