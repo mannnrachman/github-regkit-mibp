@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import socket
 import socketserver
 import threading
@@ -19,6 +20,7 @@ from camoufox.sync_api import Camoufox
 import requests
 
 from .config import Config
+from .avatars import fetch_random_avatar, write_temp_avatar
 from .litensi import LitensiClient, LitensiError
 from .mailcx import MailCxClient, MailCxError
 from .profiles import (
@@ -1401,9 +1403,318 @@ def _visible_dom_click(page, matcher_js: str) -> bool:
     ))
 
 
+def _avatar_img_srcs(page) -> list[str]:
+    """Collect current avatar image URLs on the settings profile page.
+
+    Keep query strings: GitHub cache-busts with ``?v=N`` on ``/u/{id}``.
+    """
+    try:
+        return page.evaluate(
+            """() => {
+                const nodes = [
+                  ...document.querySelectorAll(
+                    'img.avatar, img[alt*="avatar" i], img[alt*="Avatar"], '
+                    + '.avatar-user img, [data-testid="user-avatar"] img, '
+                    + 'form[action*="avatar"] img, details summary img.avatar, '
+                    + 'img[src*="/u/"], img[src*="avatars.githubusercontent"]'
+                  ),
+                ];
+                const out = [];
+                for (const img of nodes) {
+                  const src = (img.currentSrc || img.src || '').trim();
+                  if (src && !src.startsWith('data:')) out.push(src);
+                }
+                return [...new Set(out)];
+            }"""
+        ) or []
+    except Exception:
+        return []
+
+
+def _avatar_section(page):
+    """Scope locators to the Profile picture card on /settings/profile."""
+    heading = page.get_by_role(
+        "heading", name=re.compile(r"Profile picture", re.I)
+    )
+    # Walk up several ancestors so we get the card, not just the heading row.
+    for xpath in (
+        "xpath=ancestor::div[contains(@class,'Box')][1]",
+        "xpath=ancestor::section[1]",
+        "xpath=ancestor::div[position()<=6][.//summary or .//input[@type='file']][1]",
+        "xpath=ancestor::div[4]",
+    ):
+        try:
+            if heading.count() == 0:
+                break
+            card = heading.first.locator(xpath).first
+            if card.count() == 0:
+                continue
+            has_edit = card.locator("summary, button").filter(
+                has_text=re.compile(r"^Edit$", re.I)
+            ).count()
+            has_file = card.locator('input[type="file"]').count()
+            if has_edit or has_file:
+                return card
+        except Exception:
+            continue
+    # Last resort: details that contain "Upload a photo".
+    try:
+        details = page.locator("details").filter(
+            has_text=re.compile(r"Upload a photo", re.I)
+        )
+        if details.count() > 0:
+            return details.first
+    except Exception:
+        pass
+    raise SignupError(
+        "could not locate Profile picture card on /settings/profile"
+    )
+
+
+def _pick_avatar_file_input(scope):
+    """Prefer an image-accepting file input inside the avatar section."""
+    preferred = scope.locator(
+        'input[type="file"][accept*="image"], '
+        'input[type="file"][accept*="png"], '
+        'input[type="file"][accept*="jpeg"], '
+        'input[type="file"][name*="avatar" i]'
+    )
+    if preferred.count() > 0:
+        return preferred.first
+    any_file = scope.locator('input[type="file"]')
+    if any_file.count() == 0:
+        raise SignupError("no file input found in profile picture section")
+    return any_file.first
+
+
+def _wait_avatar_widget(page, timeout: int = 25_000) -> None:
+    """Wait until profile-picture Edit/file input AND an avatar img exist."""
+    deadline = time.time() + (timeout / 1000)
+    last_exc: Exception | None = None
+    while time.time() < deadline:
+        try:
+            section = _avatar_section(page)
+            edit = section.locator("summary, button").filter(
+                has_text=re.compile(r"^Edit$", re.I)
+            )
+            file_in = section.locator('input[type="file"]')
+            srcs = _avatar_img_srcs(page)
+            if (edit.count() > 0 or file_in.count() > 0) and srcs:
+                return
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(0.35)
+    raise SignupError(
+        f"profile picture widget not ready on settings page: {last_exc}"
+    )
+
+
+def _confirm_avatar_crop(page, log) -> bool:
+    """Click Set new profile picture if present.
+
+    Returns True if the confirm button was shown (and closed), False if GitHub
+    skipped the crop dialog (square upload may go straight through).
+    """
+    confirm = page.locator("button").filter(
+        has_text=re.compile(r"Set new profile picture", re.I)
+    ).first
+    try:
+        confirm.wait_for(state="visible", timeout=12_000)
+    except Exception:
+        log("[i] crop dialog not shown — expecting direct upload")
+        return False
+
+    try:
+        confirm.click(timeout=10_000)
+    except Exception:
+        if not _visible_dom_click(
+            page,
+            "b => /set new profile picture/i.test((b.textContent || '').trim())",
+        ):
+            raise SignupError("avatar crop confirm button not clickable")
+        log("[*] avatar confirm clicked via DOM")
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            if not confirm.is_visible():
+                return True
+        except Exception:
+            return True
+        time.sleep(0.35)
+    raise SignupError("avatar crop dialog did not close after confirm")
+
+
+def _verify_avatar_changed(
+    page,
+    before: list[str],
+    log,
+    network_ok: bool = False,
+) -> None:
+    """Require avatar URL change; fail closed without a baseline fingerprint."""
+    if not before:
+        raise SignupError("cannot verify avatar: no baseline avatar URL captured")
+
+    deadline = time.time() + 25
+    last: list[str] = []
+    while time.time() < deadline:
+        time.sleep(0.6)
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=30_000)
+        except Exception:
+            pass
+        try:
+            _wait_avatar_widget(page, timeout=12_000)
+        except Exception:
+            continue
+        last = _avatar_img_srcs(page)
+        if not last:
+            continue
+        if set(last) != set(before):
+            log(f"[*] avatar URL changed: {before[:1]} -> {last[:1]}")
+            return
+        for old, new in zip(sorted(before), sorted(last)):
+            if old != new:
+                log(f"[*] avatar fingerprint changed: {old} -> {new}")
+                return
+        if network_ok:
+            time.sleep(1.0)
+            last2 = _avatar_img_srcs(page)
+            if last2 and set(last2) != set(before):
+                log(f"[*] avatar URL changed after network OK: {last2[:1]}")
+                return
+    if network_ok:
+        raise SignupError(
+            f"upload network OK but avatar URL unchanged "
+            f"(before={before[:2]!r} after={last[:2]!r})"
+        )
+    raise SignupError(
+        f"avatar did not change after upload "
+        f"(before={before[:2]!r} after={last[:2]!r})"
+    )
+
+
+def _set_profile_avatar(page, username: str, cfg: Config, log) -> None:
+    """Download a random avatar and upload it via /settings/profile.
+
+    Raises on failure. Success logged only after crop/network + URL verify.
+    """
+    if not getattr(cfg, "set_profile_avatar", False):
+        return
+    providers = getattr(cfg, "avatar_providers", None)
+    proxy_url = _pick_proxy_url(cfg, log=None)
+    jpeg, provider = fetch_random_avatar(
+        seed=username or "",
+        providers=providers,
+        log=log,
+        proxy_url=proxy_url,
+    )
+    path = write_temp_avatar(jpeg, prefix=f"gh-avatar-{username or 'user'}-")
+    upload_hit = {"ok": False}
+
+    def _on_response(resp) -> None:
+        try:
+            u = (resp.url or "").lower()
+            method = ""
+            try:
+                method = (resp.request.method or "").upper()
+            except Exception:
+                method = ""
+            if resp.status >= 400:
+                return
+            if method in ("POST", "PUT", "PATCH") and any(
+                token in u
+                for token in (
+                    "/settings/avatars",
+                    "/avatars",
+                    "user_avatar",
+                    "avatar_upload",
+                )
+            ):
+                upload_hit["ok"] = True
+        except Exception:
+            pass
+
+    try:
+        page.goto(
+            "https://github.com/settings/profile",
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        _wait_avatar_widget(page)
+        before = _avatar_img_srcs(page)
+        if not before:
+            raise SignupError("baseline avatar URL missing before upload")
+        section = _avatar_section(page)
+        uploaded = False
+
+        # Listen before attaching the file so we never miss a direct POST.
+        page.on("response", _on_response)
+        try:
+            # Strategy A: Edit → Upload a photo → filechooser.
+            try:
+                edit = section.locator("summary, button").filter(
+                    has_text=re.compile(r"^Edit$", re.I)
+                ).first
+                edit.wait_for(state="visible", timeout=8_000)
+                with page.expect_file_chooser(timeout=10_000) as fc_info:
+                    edit.click(timeout=5_000)
+                    # Portal menus often render outside the card; try section then page.
+                    upload_btn = section.get_by_text(
+                        re.compile(r"Upload a photo", re.I)
+                    )
+                    if upload_btn.count() == 0:
+                        upload_btn = page.get_by_text(
+                            re.compile(r"Upload a photo", re.I)
+                        )
+                    upload_btn.first.click(timeout=5_000)
+                fc_info.value.set_files(str(path))
+                uploaded = True
+                log(f"[*] avatar file selected via filechooser ({provider})")
+            except Exception as exc:
+                log(
+                    f"[!] filechooser avatar path failed ({exc}); "
+                    "trying scoped file input"
+                )
+
+            # Strategy B: scoped file input only (never page-wide).
+            if not uploaded:
+                file_input = _pick_avatar_file_input(section)
+                file_input.wait_for(state="attached", timeout=10_000)
+                file_input.set_input_files(str(path))
+                uploaded = True
+                log(f"[*] avatar file set via scoped input ({provider})")
+
+            cropped = _confirm_avatar_crop(page, log)
+            time.sleep(1.5)
+            if not cropped and not upload_hit["ok"]:
+                deadline = time.time() + 8
+                while time.time() < deadline and not upload_hit["ok"]:
+                    time.sleep(0.4)
+            _verify_avatar_changed(
+                page, before, log, network_ok=upload_hit["ok"]
+            )
+        finally:
+            try:
+                page.remove_listener("response", _on_response)
+            except Exception:
+                pass
+
+        if upload_hit["ok"]:
+            log(f"[*] profile avatar uploaded OK ({provider}, network+url)")
+        else:
+            log(f"[*] profile avatar uploaded OK ({provider}, url verified)")
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _complete_profile(page, username: str, cfg: Config, log) -> None:
     """Set recorded status and public profile fields after 2FA is secured."""
-    if not (cfg.set_profile_status or cfg.complete_profile):
+    want_avatar = bool(getattr(cfg, "set_profile_avatar", False))
+    if not (cfg.set_profile_status or cfg.complete_profile or want_avatar):
         return
     profile = None
     if cfg.complete_profile:
@@ -1478,48 +1789,54 @@ def _complete_profile(page, username: str, cfg: Config, log) -> None:
             else:
                 raise SignupError(f"profile status did not save: {status}")
 
-    if not profile:
-        return
-    edit_button = page.locator("button[name='button']").filter(has_text="Edit profile").first
-    try:
-        edit_button.click(timeout=10_000)
-    except Exception as exc:
-        log(f"[i] Edit profile native click intercepted ({exc}); trying DOM click")
-        if not _visible_dom_click(
-            page,
-            "b => (b.textContent || '').trim() === 'Edit profile' || "
-            "b.classList.contains('js-profile-editable-edit-button')",
-        ):
-            raise SignupError("cannot open Edit profile (button not found for DOM click)")
-        log("[*] Edit profile clicked via DOM (overlay bypassed)")
+    if profile:
+        edit_button = page.locator("button[name='button']").filter(has_text="Edit profile").first
+        try:
+            edit_button.click(timeout=10_000)
+        except Exception as exc:
+            log(f"[i] Edit profile native click intercepted ({exc}); trying DOM click")
+            if not _visible_dom_click(
+                page,
+                "b => (b.textContent || '').trim() === 'Edit profile' || "
+                "b.classList.contains('js-profile-editable-edit-button')",
+            ):
+                raise SignupError("cannot open Edit profile (button not found for DOM click)")
+            log("[*] Edit profile clicked via DOM (overlay bypassed)")
 
-    name_input = page.locator("#user_profile_name").first
-    bio_input = page.locator("#user_profile_bio").first
-    location_input = page.locator("input[name='user[profile_location]']").first
-    for field in (name_input, bio_input, location_input):
-        field.wait_for(state="visible", timeout=15_000)
-    name_input.fill(profile["name"])
-    bio_input.fill(profile["bio"])
-    location_input.fill(profile["location"])
+        name_input = page.locator("#user_profile_name").first
+        bio_input = page.locator("#user_profile_bio").first
+        location_input = page.locator("input[name='user[profile_location]']").first
+        for field in (name_input, bio_input, location_input):
+            field.wait_for(state="visible", timeout=15_000)
+        name_input.fill(profile["name"])
+        bio_input.fill(profile["bio"])
+        location_input.fill(profile["location"])
 
-    try:
-        page.locator(f"form[action='/users/{username}'] button").filter(
-            has_text="Save"
-        ).first.click(timeout=10_000)
-    except Exception:
-        if not _visible_dom_click(page, "b => (b.textContent || '').trim() === 'Save'"):
-            raise SignupError("cannot submit Edit profile")
-    try:
-        page.wait_for_timeout(1_500)
-        # After a successful save, either profile text is rendered or the form
-        # retains the saved input value during its partial refresh.
-        if profile["name"] not in _page_text(page) and name_input.input_value() != profile["name"]:
-            raise SignupError("profile save was not confirmed")
-    except SignupError:
-        raise
-    except Exception:
-        pass
-    log(f"[*] profile completed: {profile['name']} | {profile['location']}")
+        try:
+            page.locator(f"form[action='/users/{username}'] button").filter(
+                has_text="Save"
+            ).first.click(timeout=10_000)
+        except Exception:
+            if not _visible_dom_click(page, "b => (b.textContent || '').trim() === 'Save'"):
+                raise SignupError("cannot submit Edit profile")
+        try:
+            page.wait_for_timeout(1_500)
+            # After a successful save, either profile text is rendered or the form
+            # retains the saved input value during its partial refresh.
+            if profile["name"] not in _page_text(page) and name_input.input_value() != profile["name"]:
+                raise SignupError("profile save was not confirmed")
+        except SignupError:
+            raise
+        except Exception:
+            pass
+        log(f"[*] profile completed: {profile['name']} | {profile['location']}")
+
+    if want_avatar:
+        try:
+            _set_profile_avatar(page, username, cfg, log)
+        except Exception as exc:
+            # Keep account; avatar is a soft post-signup stage.
+            log(f"[!] profile avatar failed (account kept): {exc}")
 
 
 def _enable_2fa(page, log) -> tuple[str, str]:

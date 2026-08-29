@@ -209,6 +209,8 @@ class ConfigBody(BaseModel):
     profile_name: Optional[str] = None
     profile_bio: Optional[str] = None
     profile_location: Optional[str] = None
+    set_profile_avatar: Optional[bool] = None
+    avatar_providers: Optional[list] = None
 
 
 def _save_config(cfg: Config) -> None:

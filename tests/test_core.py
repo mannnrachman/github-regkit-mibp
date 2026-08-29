@@ -102,6 +102,44 @@ def test_parse_public_profile():
         raise AssertionError("invalid profile payload must fail")
 
 
+def test_avatar_normalize_and_providers():
+    from PIL import Image
+
+    from github_register.avatars import (
+        normalize_avatar,
+        requests_proxies,
+        resolve_providers,
+        write_temp_avatar,
+    )
+
+    assert resolve_providers(None) == ["dicebear", "nekos", "waifu_im"]
+    assert resolve_providers(["waifu", "dicebear", "dicebear", "nope"]) == [
+        "waifu_im",
+        "dicebear",
+    ]
+
+    assert requests_proxies("") is None
+    socks = requests_proxies("socks5://u:p@1.2.3.4:1080")
+    assert socks["http"].startswith("socks5h://u:p@1.2.3.4:1080")
+    http = requests_proxies("http://u:p@5.6.7.8:8080")
+    assert http["https"] == "http://u:p@5.6.7.8:8080"
+
+    buf = __import__("io").BytesIO()
+    Image.new("RGB", (800, 600), color=(30, 144, 255)).save(buf, format="PNG")
+    jpeg = normalize_avatar(buf.getvalue(), size=500)
+    assert jpeg[:2] == b"\xff\xd8"
+    assert len(jpeg) < 950_000
+    img = Image.open(__import__("io").BytesIO(jpeg))
+    assert img.size == (500, 500)
+
+    path = write_temp_avatar(jpeg)
+    try:
+        assert path.is_file()
+        assert path.stat().st_size == len(jpeg)
+    finally:
+        path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     for name, fn in sorted((n, f) for n, f in globals().items() if n.startswith("test_")):
         fn()

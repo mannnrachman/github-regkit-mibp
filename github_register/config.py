@@ -40,6 +40,9 @@ class Config:
     profile_name: str = ""            # blank = Random User
     profile_bio: str = ""             # blank = ZenQuotes
     profile_location: str = ""        # blank = Random User country
+    # random avatar from dicebear / nekos / waifu_im (shuffled per account)
+    set_profile_avatar: bool = True
+    avatar_providers: list | None = None  # None = all three; subset to restrict
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":

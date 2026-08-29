@@ -64,3 +64,5 @@ regkit_codebuddy.*
 *.tmp
 .DS_Store
 proxies.txt*
+.codebase-memory/
+gh-avatar-*.jpg

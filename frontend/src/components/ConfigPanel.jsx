@@ -144,6 +144,13 @@ const POST_FIELDS = [
     wide: true,
   },
   {
+    key: "set_profile_avatar",
+    label: "Set random profile avatar (DiceBear / nekos / waifu.im)",
+    type: "checkbox",
+    group: "Post-Signup Stages",
+    wide: true,
+  },
+  {
     key: "profile_name",
     label: "Profile name (blank = Random User)",
     group: "Post-Signup Stages",

@@ -15,7 +15,8 @@ from the CLI or through a local web console.
 - Logs in again when a newly verified account is redirected to `/login`.
 - Optionally creates a first repository, enables TOTP 2FA, and stores recovery
   codes per account.
-- Optionally sets a profile status and completes profile fields after 2FA.
+- Optionally sets a profile status, completes profile fields, and uploads a
+  random anime-style avatar (DiceBear / nekos.best / waifu.im, shuffled).
 - Provides a web console for configuration, job control, live logs, account
   export, TOTP generation, and recovery-code viewing.
 
@@ -105,7 +106,9 @@ Set your local values in `config.json`. This file must never be committed.
   "complete_profile": true,
   "profile_name": "",
   "profile_bio": "",
-  "profile_location": ""
+  "profile_location": "",
+  "set_profile_avatar": true,
+  "avatar_providers": ["dicebear", "nekos", "waifu_im"]
 }
 ```
 
@@ -129,6 +132,8 @@ Set your local values in `config.json`. This file must never be committed.
 | `set_profile_status` / `profile_status` | Enables and sets a post-2FA profile status. |
 | `complete_profile` | Enables post-2FA profile completion. |
 | `profile_name`, `profile_bio`, `profile_location` | Custom profile values. Blank fields use Random User or ZenQuotes data. |
+| `set_profile_avatar` | Uploads a random anime-style avatar after profile fields (best-effort). |
+| `avatar_providers` | Provider pool to shuffle: `dicebear`, `nekos`, `waifu_im`. |
 
 ## Running
 
